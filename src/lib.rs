@@ -1,4 +1,5 @@
 use redb::{Database, TableDefinition};
+use simd_json::OwnedValue;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -31,26 +32,52 @@ impl DBEngine {
         Ok(Self { db: Arc::new(db) })
     }
 
-    pub fn insert(&self, id: &str, payload: &[u8]) -> Result<(), redb::Error> {
-        let write_txn = self.db.begin_write()?;
+    pub fn insert(&self, id: &str, payload: &mut [u8]) -> Result<(), String> {
+        // validate and parse JSON data at CPU vector speeds.
+        // if json is not valid, raise error to user.
+        let _parsed: OwnedValue = simd_json::to_owned_value(payload)
+            .map_err(|e| format!("Invalid JSON payload for id {}: {}", id, e))?;
+
+        // write to the disk if the json data is only valid.
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
 
         {
-            let mut tickets_table = write_txn.open_table(DOCUMENTS_TABLE)?;
-            tickets_table.insert(id, payload)?;
+            let mut tickets_table = write_txn
+                .open_table(DOCUMENTS_TABLE)
+                .map_err(|e| e.to_string())?;
+
+            // re borrow the mutated payload variable, as an immutable
+            // for redb function.
+            tickets_table
+                .insert(id, &*payload)
+                .map_err(|e| e.to_string())?;
         }
-        write_txn.commit()?;
+        write_txn.commit().map_err(|e| e.to_string())?;
         Ok(())
     }
 
-    pub fn insert_many(&self, records: &[(&str, &[u8])]) -> Result<(), redb::Error> {
-        let write_txn = self.db.begin_write()?;
+    pub fn insert_many(&self, records: &mut [(&str, &mut [u8])]) -> Result<(), String> {
+        // Validate the entire batch data, before we try to open a DB Transaction.
+        // if one of those item is not validated, we skip the insert.
+
+        for (id, payload) in records.iter_mut() {
+            simd_json::to_owned_value(*payload)
+                .map_err(|e| format!("Invalid json in batch for id {}: {}", id, e))?;
+        }
+
+        // Write to disk, if all the items of the batch data are valid.
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
         {
-            let mut tickets_table = write_txn.open_table(DOCUMENTS_TABLE)?;
+            let mut tickets_table = write_txn
+                .open_table(DOCUMENTS_TABLE)
+                .map_err(|e| e.to_string())?;
             for (id, payload) in records {
-                tickets_table.insert(*id, *payload)?;
+                tickets_table
+                    .insert(*id, &**payload)
+                    .map_err(|e| e.to_string())?;
             }
         }
-        write_txn.commit()?;
+        write_txn.commit().map_err(|e| e.to_string())?;
         Ok(())
     }
 
