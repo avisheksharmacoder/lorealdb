@@ -1,3 +1,6 @@
+use pyo3::exceptions::PyRuntimeError;
+use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 use redb::{Database, TableDefinition};
 use simd_json::OwnedValue;
 use std::path::Path;
@@ -8,97 +11,154 @@ use std::sync::Arc;
 const DOCUMENTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("documents");
 const LOGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("logs");
 
-// create the db engiine.
+// create the db engine.
+#[pyclass]
 pub struct DBEngine {
     db: Arc<Database>,
 }
 
+#[pymethods]
 impl DBEngine {
-    // method to create the tables.
-    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, redb::Error> {
+    #[new]
+    // Create the tables if they don't exist.
+    pub fn new(path: &str) -> PyResult<Self> {
         // create the database object.
-        let db = Database::create(path)?;
+        let db = Database::create(path).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         // open a write transaction and create the tables if they dont exist.
         // once created, commit the changes.
-        let write_txn = db.begin_write()?;
+        let write_txn = db
+            .begin_write()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         {
-            write_txn.open_table(DOCUMENTS_TABLE)?;
-            write_txn.open_table(LOGS_TABLE)?;
+            write_txn
+                .open_table(DOCUMENTS_TABLE)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            write_txn
+                .open_table(LOGS_TABLE)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         }
-        write_txn.commit()?;
+        write_txn
+            .commit()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         // return Self inside Ok()
         Ok(Self { db: Arc::new(db) })
     }
 
-    pub fn insert(&self, id: &str, payload: &mut [u8]) -> Result<(), String> {
+    // Insert a new record into the Documents Table.
+    pub fn insert(&self, id: &str, payload: &[u8]) -> PyResult<()> {
+        // make a mutable copy for simd_json to parse.
+        let mut buffer: Vec<u8> = payload.to_vec();
+
         // validate and parse JSON data at CPU vector speeds.
         // if json is not valid, raise error to user.
-        let _parsed: OwnedValue = simd_json::to_owned_value(payload)
-            .map_err(|e| format!("Invalid JSON payload for id {}: {}", id, e))?;
+        let _parsed: OwnedValue = simd_json::to_owned_value(&mut buffer).map_err(|e| {
+            PyRuntimeError::new_err(format!("Invalid JSON payload for id {}: {}", id, e))
+        })?;
 
         // write to the disk if the json data is only valid.
-        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| PyRuntimeError::new_error(e.to_string()))?;
 
         {
             let mut tickets_table = write_txn
                 .open_table(DOCUMENTS_TABLE)
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| PyRuntimeError::new_error(e.to_string()))?;
 
             // re borrow the mutated payload variable, as an immutable
             // for redb function.
             tickets_table
                 .insert(id, &*payload)
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| PyRuntimeError::new_error(e.to_string()))?;
         }
-        write_txn.commit().map_err(|e| e.to_string())?;
+
+        write_txn
+            .commit()
+            .map_err(|e| PyRuntimeError::new_error(e.to_string()))?;
+
         Ok(())
     }
 
-    pub fn insert_many(&self, records: &mut [(&str, &mut [u8])]) -> Result<(), String> {
+    // Insert many records into the Documents Table.
+    pub fn insert_many(&self, records: Vec[(&str, &[u8])]) -> PyResult<()> {
         // Validate the entire batch data, before we try to open a DB Transaction.
         // if one of those item is not validated, we skip the insert.
+        for (id, payload) in &records {
+            // create a mutable vector for simd_json to use. 
+            let mut buffer: Vec<u8> = payload.to_vec();
 
-        for (id, payload) in records.iter_mut() {
-            simd_json::to_owned_value(*payload)
-                .map_err(|e| format!("Invalid json in batch for id {}: {}", id, e))?;
+            simd_json::to_owned_value(*payload).map_err(|e| {
+                PyRuntimeError::new_err(format!("Invalid json in batch for id {}: {}", id, e))
+            })?;
         }
 
         // Write to disk, if all the items of the batch data are valid.
-        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| PyRuntimeError::new_error(e.to_string()))?;
+
         {
             let mut tickets_table = write_txn
                 .open_table(DOCUMENTS_TABLE)
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| PyRuntimeError::new_error(e.to_string()))?;
+
             for (id, payload) in records {
                 tickets_table
-                    .insert(*id, &**payload)
-                    .map_err(|e| e.to_string())?;
+                    .insert(id, payload)
+                    .map_err(|e| PyRuntimeError::new_error(e.to_string()))?;
             }
         }
-        write_txn.commit().map_err(|e| e.to_string())?;
+
+        write_txn
+            .commit()
+            .map_err(|e| PyRuntimeError::new_error(e.to_string()))?;
         Ok(())
     }
 
-    pub fn get(&self, id: &str) -> Result<Option<Vec<u8>>, redb::Error> {
-        let read_txn = self.db.begin_read()?;
-        let tickets_table = read_txn.open_table(DOCUMENTS_TABLE)?;
 
-        if let Some(access_guard) = tickets_table.get(id)? {
-            return Ok(Some(access_guard.value().to_vec()));
+
+    pub fn get<'py>(&self, py: Python<'py>, id: &str) -> PyResult<Option<&'py PyBytes> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| PyRuntimeError::new_error(e.to_string()))?;
+        
+        let tickets_table = read_txn.open_table(DOCUMENTS_TABLE)
+            .map_err(|e| PyRuntimeError::new_error(e.to_string()))?;
+
+        if let Some(access_guard) = tickets_table.get(id)
+            .map_err(|e| PyRuntimeError::new_error(e.to_string()))? {
+            return Ok(Some(PyBytes::new_bound(py, access_guard.value())));
+
         } else {
             Ok(None)
         }
     }
 
-    pub fn delete(&self, id: &str) -> Result<bool, redb::Error> {
-        let write_txn = self.db.begin_write()?;
+
+
+    pub fn delete(&self, id: &str) -> PyResult<bool> {
+        let write_txn = self.db.begin_write()
+            .map_err(|e| PyRuntimeError::new_error(e.to_string()))?;
+
         let record_existed = {
-            let mut tickets_table = write_txn.open_table(DOCUMENTS_TABLE)?;
-            tickets_table.remove(id)?.is_some()
+            let mut tickets_table = write_txn.open_table(DOCUMENTS_TABLE)
+                .map_err(|e| PyRuntimeError::new_error(e.to_string()))?;
+
+            tickets_table.remove(id)
+                .map_err(|e| PyRuntimeError::new_error(e.to_string()))?.is_some()
         };
-        write_txn.commit()?;
+        write_txn.commit().map_err(|e| PyRuntimeError::new_error(e.to_string()))?;
         Ok(record_existed)
     }
+}
+
+#[pymodule]
+fn lorealdb(_py: Python, m: &PyModule) -> PyResult<()> {
+    m.add_class::<DBEngine()?>;
+    Ok(())
 }

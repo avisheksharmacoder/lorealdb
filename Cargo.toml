@@ -4,9 +4,19 @@ version = "0.1.0"
 edition = "2024"
 
 
+[lib]
+name = "lorealdb"
+crate-type = [ "cdylib", "rlib" ]
+
+
 [dependencies]
 redb = "2.1.1"
 simd-json = "0.13.0"
+
+
+[dependencies.pyo3]
+version = "0.20.2"
+features = [ "extension_module" ]
 
 
 [dev-dependencies]
