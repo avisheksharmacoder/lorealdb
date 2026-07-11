@@ -3,12 +3,12 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use redb::{Database, TableDefinition};
 use simd_json::OwnedValue;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 // Define the key table and log table for storing logs.
 // TableDefinition<K, V>, K is key, V is value. &str is ref to str, &[u8] has ref + size
 const DOCUMENTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("documents");
-const LOGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("logs");
 
 // create the db engine.
 #[pyclass]
@@ -32,9 +32,6 @@ impl DBEngine {
         {
             write_txn
                 .open_table(DOCUMENTS_TABLE)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            write_txn
-                .open_table(LOGS_TABLE)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         }
         write_txn
@@ -184,6 +181,44 @@ impl DBEngine {
         } else {
             Ok(None)
         }
+    }
+
+    // Get all recoords from the documents table in a single call, using Rust Hashmap.
+    // Hashmap helps us to map to a python dictionary directly.
+    pub fn get_many<'py>(
+        &self,
+        py: Python<'py>,
+        ids: Vec<String>,
+    ) -> PyResult<HashMap<String, Option<Bound<'py, PyBytes>>>> {
+        // create a read transaction.
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        //  Fetch the data of the Documents table.
+        let tickets_table = read_txn
+            .open_table(DOCUMENTS_TABLE)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        // Preallocate the hashmap data capacity to prevent reallocation overhead.
+        let mut document_results = HashMap::with_capacity(ids.len());
+
+        // populate the hashmap with the result items.
+        for id in ids {
+            if let Some(access_guard) = tickets_table
+                .get(id.as_str())
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+            {
+                // add the id and access_guard value, if found from the table.
+                document_results.insert(id, Some(PyBytes::new_bound(py, access_guard.value())));
+            } else {
+                // add the id and None.
+                document_results.insert(id, None);
+            }
+        }
+
+        Ok(document_results)
     }
 
     pub fn delete(&self, id: &str) -> PyResult<bool> {
