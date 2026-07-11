@@ -243,10 +243,59 @@ impl DBEngine {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(record_existed)
     }
+
+    // Prefix scanning for ID.
+    // Scan IDs of the all the records where the id starts with a prefix string.
+    // Return a dictionary mapping the id to its raw bytes.
+    pub fn scan_prefix<'py>(
+        &self,
+        py: Python<'py>,
+        prefix: &str,
+    ) -> PyResult<HashMap<String, Bound<'py, PyBytes>>> {
+        // Create a read transaction from the DB Engine.
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        // Get the Documents table.
+        let document_table = read_txn
+            .open_table(DOCUMENTS_TABLE)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        // create a hashmap to return the results into.
+        let mut results = HashMap::new();
+
+        // create an iterator starting from the prefix to the end of the db
+        // use range to create the iterator.
+        let table_iterator = document_table
+            .range(prefix..)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        for item in table_iterator {
+            let (key_guard, value_guard) =
+                item.map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let current_key = key_guard.value();
+
+            // in redb, keyguards are sorted alphabetically.
+            // if we do not find a key, that means there are no keys that match the prefix.
+            // So from here, we break out to save CPU.
+            if !current_key.starts_with(prefix) {
+                break;
+            }
+
+            // if we find keys, insert it into the hashmap, the id and the bytes.
+            results.insert(
+                current_key.to_string(),
+                PyBytes::new_bound(py, value_guard.value()),
+            );
+        }
+        Ok(results)
+    }
 }
 
 #[pymodule]
 fn lorealdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<DBEngine>();
+    let _ = m.add_class::<DBEngine>();
     Ok(())
 }
