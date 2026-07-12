@@ -1,15 +1,18 @@
 use lorealdb::DBEngine;
+use pyo3::prelude::*;
 use std::time::Instant;
 use tempfile::tempdir;
 
 #[test]
 fn test_100k_inserts_and_reads() {
+    // 1. Boot up the Python Interpreter for this test process
+    pyo3::prepare_freethreaded_python();
+
     let dir = tempdir().expect("Failed to create temp dir");
     let db_path = dir.path().join("fiori_test.redb");
 
-    let engine = DBEngine::new(&db_path).expect("Failed to initialize engine");
+    let engine = DBEngine::new(db_path.to_str().unwrap()).expect("Failed to initialize engine");
 
-    // 1. Prepare data in memory first so we isolate DB write time
     let mut data_store = Vec::with_capacity(100_000);
     for i in 0..100_000 {
         let id = format!("ticket_{}", i);
@@ -17,55 +20,151 @@ fn test_100k_inserts_and_reads() {
         data_store.push((id, payload));
     }
 
-    // Convert into slice of references for the engine
-    let mut batch: Vec<(&str, &mut [u8])> = data_store
-        .iter_mut()
-        .map(|(id, payload)| (id.as_str(), payload.as_mut_slice()))
-        .collect();
-
     let start_write = Instant::now();
 
-    // 2. Perform the single-transaction batch insert
-    engine.insert_many(&mut batch).expect("Batch insert failed");
+    engine.insert_many(data_store).expect("Batch insert failed");
 
     println!(
         "100k batch-transaction inserts completed in: {:?}",
         start_write.elapsed()
     );
 
-    // 3. Validate a specific record for byte equality
     let test_id = "ticket_88888";
     let expected_payload = format!("{{\"status\": \"open\", \"id\": \"{}\"}}", test_id);
 
-    let retrieved = engine
-        .get(test_id)
-        .expect("Read transaction failed")
-        .expect("Key not found");
+    Python::with_gil(|py| {
+        let retrieved = engine
+            .get(py, test_id)
+            .expect("Read transaction failed")
+            .expect("Key not found");
 
-    assert_eq!(
-        retrieved,
-        expected_payload.as_bytes(),
-        "Byte equality assertion failed!"
-    );
+        assert_eq!(
+            retrieved.as_bytes(),
+            expected_payload.as_bytes(),
+            "Byte equality assertion failed!"
+        );
+    });
 }
 
 #[test]
 fn test_json_validation_rejection() {
+    // 1. Boot up the Python Interpreter for this test process
+    pyo3::prepare_freethreaded_python();
+
     let dir = tempfile::tempdir().expect("Failed to create temp dir");
     let db_path = dir.path().join("fiori_validation_test.redb");
-    let engine = DBEngine::new(&db_path).expect("Failed to initialize engine");
+
+    let engine = DBEngine::new(db_path.to_str().unwrap()).expect("Failed to initialize engine");
 
     let id = "ticket_malformed";
+    let bad_payload = String::from("{\"status\": \"open, \"id\": 123").into_bytes();
 
-    // Notice the missing closing brace and quote
-    let mut bad_payload = String::from("{\"status\": \"open, \"id\": 123").into_bytes();
-
-    let result = engine.insert(id, &mut bad_payload);
+    let result = engine.insert(id, &bad_payload);
 
     assert!(
         result.is_err(),
         "Engine should have rejected malformed JSON!"
     );
 
+    // We can unwrap_err() safely now because the interpreter is running
     println!("Successfully rejected bad JSON: {:?}", result.unwrap_err());
+}
+
+#[test]
+fn test_prefix_scanning_100k() {
+    // 1. Boot up the Python Interpreter
+    pyo3::prepare_freethreaded_python();
+
+    let dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let db_path = dir.path().join("prefix_scan_test.redb");
+    let engine = DBEngine::new(db_path.to_str().unwrap()).expect("Failed to initialize engine");
+
+    // 2. Prepare 100k mixed records (80k tickets, 20k invoices)
+    let mut data_store = Vec::with_capacity(100_000);
+    for i in 0..80_000 {
+        let id = format!("ticket_{}", i);
+        let payload = format!("{{\"type\": \"ticket\", \"id\": \"{}\"}}", id).into_bytes();
+        data_store.push((id, payload));
+    }
+    for i in 0..20_000 {
+        let id = format!("invoice_{}", i);
+        let payload = format!("{{\"type\": \"invoice\", \"id\": \"{}\"}}", id).into_bytes();
+        data_store.push((id, payload));
+    }
+
+    // 3. Insert the batch
+    engine.insert_many(data_store).expect("Batch insert failed");
+
+    // 4. Test Prefix Scanning performance
+    Python::with_gil(|py| {
+        let start_scan = Instant::now();
+
+        let results = engine
+            .scan_prefix(py, "invoice_")
+            .expect("Prefix scan failed");
+
+        println!(
+            "Scanned and retrieved 20k 'invoice_' records out of 100k total in: {:?}",
+            start_scan.elapsed()
+        );
+
+        // 5. Assertions
+        assert_eq!(
+            results.len(),
+            20_000,
+            "Engine should have found exactly 20,000 invoices!"
+        );
+    });
+}
+
+#[test]
+fn test_get_many_performance() {
+    // 1. Boot up the Python Interpreter
+    pyo3::prepare_freethreaded_python();
+
+    let dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let db_path = dir.path().join("get_many_test.redb");
+    let engine = DBEngine::new(db_path.to_str().unwrap()).expect("Failed to initialize engine");
+
+    // 2. Prepare 100k records
+    let mut data_store = Vec::with_capacity(100_000);
+    for i in 0..100_000 {
+        let id = format!("ticket_{}", i);
+        let payload = format!("{{\"status\": \"closed\", \"id\": \"{}\"}}", id).into_bytes();
+        data_store.push((id, payload));
+    }
+    engine.insert_many(data_store).expect("Batch insert failed");
+
+    // 3. Create a target list of 10,000 distinct IDs scattered across the DB
+    let mut target_ids = Vec::with_capacity(10_000);
+    for i in (0..100_000).step_by(10) {
+        target_ids.push(format!("ticket_{}", i));
+    }
+
+    // 4. Test get_many performance
+    Python::with_gil(|py| {
+        let start_get = Instant::now();
+
+        let results = engine
+            .get_many(py, target_ids)
+            .expect("get_many transaction failed");
+
+        println!(
+            "Fetched 10,000 distinct records using get_many in: {:?}",
+            start_get.elapsed()
+        );
+
+        // 5. Assertions
+        assert_eq!(
+            results.len(),
+            10_000,
+            "Should have returned exactly 10,000 results in the hashmap"
+        );
+
+        // Spot check that a specific record was actually found (is Some)
+        assert!(
+            results.get("ticket_50000").unwrap().is_some(),
+            "ticket_50000 should exist in the results"
+        );
+    });
 }
