@@ -1,14 +1,20 @@
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use redb::{Database, TableDefinition};
+use redb::{Database, MultimapTableDefinition, TableDefinition};
+use simd_json::prelude::*;
 use simd_json::OwnedValue;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::vec;
 
 // Define the key table and log table for storing logs.
 // TableDefinition<K, V>, K is key, V is value. &str is ref to str, &[u8] has ref + size
 const DOCUMENTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("documents");
+
+// create the Multi map table definition for faster Metadata filtering.
+const METADATA_TABLE: MultimapTableDefinition<&str, &str> =
+    MultimapTableDefinition::new("metadata_index");
 
 // create the db engine.
 #[pyclass]
@@ -33,6 +39,10 @@ impl DBEngine {
             write_txn
                 .open_table(DOCUMENTS_TABLE)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+            write_txn
+                .open_multimap_table(METADATA_TABLE)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         }
         write_txn
             .commit()
@@ -49,7 +59,7 @@ impl DBEngine {
 
         // validate and parse JSON data at CPU vector speeds.
         // if json is not valid, raise error to user.
-        let _parsed: OwnedValue = simd_json::to_owned_value(&mut buffer).map_err(|e| {
+        let _parsed_json: OwnedValue = simd_json::to_owned_value(&mut buffer).map_err(|e| {
             PyRuntimeError::new_err(format!("Invalid JSON payload for id {}: {}", id, e))
         })?;
 
@@ -64,11 +74,33 @@ impl DBEngine {
                 .open_table(DOCUMENTS_TABLE)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
+            // open metadata index table as well, to optimize read for future.
+            let mut metadata_index_table = write_txn
+                .open_multimap_table(METADATA_TABLE)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
             // re borrow the mutated payload variable, as an immutable
             // for redb function.
             tickets_table
                 .insert(id, &*payload)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+            // we have to iterate through the JSON string and index all the string values
+            // into the metadata index table.
+            if let Some(json_object) = _parsed_json.as_object() {
+                for (key, value) in json_object {
+                    // for now index flat strings.
+                    if let Some(value_str) = value.as_str() {
+                        let key_value = format!("{}:{}", key, value_str);
+
+                        // insert the record into the metadata index table.
+                        // store in the key:Value : id format.
+                        metadata_index_table
+                            .insert(key_value.as_str(), id)
+                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    }
+                }
+            }
         }
 
         write_txn
@@ -80,15 +112,23 @@ impl DBEngine {
 
     // Insert many records into the Documents Table.
     pub fn insert_many(&self, records: Vec<(String, Vec<u8>)>) -> PyResult<()> {
+        // create a mutable object to store the validated records, during the simd validation.
+        // This is done to save the parsed json for metadata filtering later.
+        let mut parsed_json_objects: Vec<(String, Vec<u8>, OwnedValue)> =
+            Vec::with_capacity(records.len());
+
         // Validate the entire batch data, before we try to open a DB Transaction.
         // if one of those item is not validated, we skip the insert.
-        for (id, payload) in &records {
+        for (id, payload) in records {
             // create a mutable vector for simd_json to use.
             let mut buffer: Vec<u8> = payload.to_vec();
 
-            simd_json::to_owned_value(&mut buffer).map_err(|e| {
+            let _parsed_json = simd_json::to_owned_value(&mut buffer).map_err(|e| {
                 PyRuntimeError::new_err(format!("Invalid json in batch for id {}: {}", id, e))
             })?;
+
+            // insert the validated json into the mutable vector object.
+            parsed_json_objects.push((id, payload, _parsed_json));
         }
 
         // Write to disk, if all the items of the batch data are valid.
@@ -98,14 +138,37 @@ impl DBEngine {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         {
+            // fetch the documents table.
             let mut tickets_table = write_txn
                 .open_table(DOCUMENTS_TABLE)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-            for (id, payload) in records {
+            // fetch the metadata index table as well, to optimize read operations for future.
+            let mut metadata_index_table = write_txn
+                .open_multimap_table(METADATA_TABLE)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+            for (id, payload, parsed_json) in parsed_json_objects {
                 tickets_table
                     .insert(id.as_str(), payload.as_slice())
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+                // we have to iterate through the JSON string from the validated_record object and
+                // index all the string values into the metadata index table.
+                if let Some(json_object) = parsed_json.as_object() {
+                    for (key, value) in json_object {
+                        // for now index flat strings.
+                        if let Some(value_str) = value.as_str() {
+                            let key_value = format!("{}:{}", key, value_str);
+
+                            // insert the record into the metadata index table.
+                            // store in the key:Value : id format.
+                            metadata_index_table
+                                .insert(key_value.as_str(), id.as_str())
+                                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                        }
+                    }
+                }
             }
         }
 
@@ -244,7 +307,7 @@ impl DBEngine {
         Ok(record_existed)
     }
 
-    // Prefix scanning for ID.
+    // Prefix scanning for Document ID.
     // Scan IDs of the all the records where the id starts with a prefix string.
     // Return a dictionary mapping the id to its raw bytes.
     pub fn scan_prefix<'py>(
@@ -289,6 +352,63 @@ impl DBEngine {
                 current_key.to_string(),
                 PyBytes::new_bound(py, value_guard.value()),
             );
+        }
+        Ok(results)
+    }
+
+    // Function to implement basic metadata filtering.
+    pub fn filter_by_metadata<'py>(
+        &self,
+        py: Python<'py>,
+        index_key: &str,
+        index_value: &str,
+    ) -> PyResult<HashMap<String, Bound<'py, PyBytes>>> {
+        // create a read transaction.
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        // open the documents table.
+        let documents_table = read_txn
+            .open_table(DOCUMENTS_TABLE)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        // open the metadata index table for storing the fetched key and value pairs
+        // from Python.
+        let metadata_index_table = read_txn
+            .open_multimap_table(METADATA_TABLE)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        // format the search term into key:value format.
+        let search_term_formatted = format!("{}:{}", index_key, index_value);
+
+        // create the results hashmap to send to Python after data processing.
+        let mut results = HashMap::new();
+
+        // fetch all the matching document IDs from the index table, which needs to be implemented at
+        // insert time for the documents table. This introduces a write time slowness but this is a Read
+        // Optimized DB Engine.
+        let matching_id_iterator = metadata_index_table
+            .get(search_term_formatted.as_str())
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        // fetch records that we actually need to send to Python, from the documents table
+        // using the iterator created from the metadata index table.
+        for document_id in matching_id_iterator {
+            let id_guard = document_id.map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let doc_id = id_guard.value();
+
+            // now fetch the document from the documents table using the guard pattern.
+            if let Some(doc_guard) = documents_table
+                .get(doc_id)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+            {
+                results.insert(
+                    doc_id.to_string(),
+                    PyBytes::new_bound(py, doc_guard.value()),
+                );
+            }
         }
         Ok(results)
     }

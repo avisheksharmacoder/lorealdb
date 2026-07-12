@@ -168,3 +168,68 @@ fn test_get_many_performance() {
         );
     });
 }
+
+#[test]
+fn test_indexed_metadata_filtering_100k() {
+    // 1. Boot up the Python Interpreter
+    pyo3::prepare_freethreaded_python();
+
+    let dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let db_path = dir.path().join("metadata_filter_test.redb");
+    let engine = DBEngine::new(db_path.to_str().unwrap()).expect("Failed to initialize engine");
+
+    // 2. Prepare 100k records: 95k closed, 5k open
+    let mut data_store = Vec::with_capacity(100_000);
+
+    for i in 0..95_000 {
+        let id = format!("ticket_{}", i);
+        let payload = format!("{{\"status\": \"closed\", \"id\": \"{}\"}}", id).into_bytes();
+        data_store.push((id, payload));
+    }
+
+    for i in 95_000..100_000 {
+        let id = format!("ticket_{}", i);
+        let payload = format!("{{\"status\": \"open\", \"id\": \"{}\"}}", id).into_bytes();
+        data_store.push((id, payload));
+    }
+
+    // 3. Insert the batch (This will measure the "Write Tax" of building the index)
+    let start_insert = Instant::now();
+    engine.insert_many(data_store).expect("Batch insert failed");
+    println!(
+        "Inserted 100k records (including building the Multimap Index) in: {:?}",
+        start_insert.elapsed()
+    );
+
+    // 4. Test the O(1) Metadata Filtering performance
+    Python::with_gil(|py| {
+        let start_filter = Instant::now();
+
+        // Fetch ONLY the open tickets
+        let results = engine
+            .filter_by_metadata(py, "status", "open")
+            .expect("Metadata filtering failed");
+
+        println!(
+            "O(1) Indexed Filter found 5,000 'open' records out of 100k in: {:?}",
+            start_filter.elapsed()
+        );
+
+        // 5. Assertions
+        assert_eq!(
+            results.len(),
+            5_000,
+            "Engine should have found exactly 5,000 open tickets!"
+        );
+
+        // Verify that the data we pulled is actually correct
+        let sample_record = results.get("ticket_99999").expect("Record should exist");
+        let sample_bytes = sample_record.as_bytes();
+        let sample_str = std::str::from_utf8(sample_bytes).unwrap();
+
+        assert!(
+            sample_str.contains("\"status\": \"open\""),
+            "Retrieved record did not contain the correct metadata"
+        );
+    });
+}
