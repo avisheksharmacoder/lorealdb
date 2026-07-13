@@ -1,2 +1,20 @@
 /target
-pyproject.toml
+
+# 1. Rust build artifacts
+target/
+
+# 2. Python build artifacts and cache
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# 3. Compiled PyO3 Binaries (CRITICAL)
+*.so
+*.pyd
+*.dylib
+
+# 4. Maturin wheel packages
+*.whl
