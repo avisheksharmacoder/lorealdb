@@ -177,54 +177,6 @@ impl DBEngine {
         Ok(())
     }
 
-    // function to insert already validated single raw JSON bytes
-    pub fn insert_raw(&self, id: &str, payload: &[u8]) -> PyResult<()> {
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        {
-            let mut tickets_table = write_txn
-                .open_table(DOCUMENTS_TABLE)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            tickets_table
-                .insert(id, payload)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        }
-
-        write_txn
-            .commit()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(())
-    }
-
-    // function to insert already validated many JSON bytes.
-    pub fn insert_many_raw(&self, records: Vec<(String, Vec<u8>)>) -> PyResult<()> {
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        {
-            let mut tickets_table = write_txn
-                .open_table(DOCUMENTS_TABLE)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            for (id, payload) in records {
-                tickets_table
-                    .insert(id.as_str(), payload.as_slice())
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            }
-        }
-
-        write_txn
-            .commit()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(())
-    }
-
     pub fn get<'py>(&self, py: Python<'py>, id: &str) -> PyResult<Option<Bound<'py, PyBytes>>> {
         let read_txn = self
             .db
