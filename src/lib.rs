@@ -1,12 +1,11 @@
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use redb::{Database, MultimapTableDefinition, TableDefinition};
+use redb::{Database, MultimapTableDefinition, ReadableTable, TableDefinition};
 use simd_json::prelude::*;
 use simd_json::OwnedValue;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::vec;
 
 // Define the key table and log table for storing logs.
 // TableDefinition<K, V>, K is key, V is value. &str is ref to str, &[u8] has ref + size
@@ -354,6 +353,87 @@ impl DBEngine {
             );
         }
         Ok(results)
+    }
+
+    // Function to implement upsert/update functionality.
+    // We need to update a record in the documents table, with a get() and then insert().
+    // We also need to update the metadata strings of that record in the metadata index table.
+    pub fn upsert<'py>(&self, id: &str, payload: &[u8]) -> PyResult<()> {
+        // make a mutable copy for simd_json to parse.
+        let mut buffer: Vec<u8> = payload.to_vec();
+
+        // validate and parse JSON data at CPU vector speeds.
+        // if json is not valid, raise error to user.
+        let new_parsed_json: OwnedValue = simd_json::to_owned_value(&mut buffer).map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "Invalid JSON payload for upsert operation, id {}: {}",
+                id, e
+            ))
+        })?;
+
+        // open a write transaction from the DB.
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        {
+            // Open the documents table and the metadata indexing table as well.
+            let mut documents_table = write_txn
+                .open_table(DOCUMENTS_TABLE)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+            let mut metadata_indexing_table = write_txn
+                .open_multimap_table(METADATA_TABLE)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+            // safely extract the old metadata and drop the guard immediately.
+            let old_data_opt = documents_table
+                .get(id)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                .map(|guard| guard.value().to_vec());
+
+            // check if an existing record is available or not.
+            if let Some(mut old_buffer) = old_data_opt {
+                if let Ok(old_parsed_json) = simd_json::to_owned_value(&mut old_buffer) {
+                    if let Some(old_json_object) = old_parsed_json.as_object() {
+                        for (key, value) in old_json_object {
+                            if let Some(value_str) = value.as_str() {
+                                let old_key_value = format!("{}:{}", key, value_str);
+
+                                // remove the value for this specific id only from the metadata indexing table.
+                                let _ = metadata_indexing_table.remove(old_key_value.as_str(), id);
+                            }
+                        }
+                    }
+                }
+
+                // now insert new payload into the table.
+                documents_table
+                    .insert(id, payload)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+                // now populate the metadata indexing table with the new parsed json data.
+                if let Some(new_json_object) = new_parsed_json.as_object() {
+                    for (key, value) in new_json_object {
+                        if let Some(value_str) = value.as_str() {
+                            let new_key_value = format!("{}:{}", key, value_str);
+
+                            // store the new key value and id into metadata indexingg table
+                            metadata_indexing_table
+                                .insert(new_key_value.as_str(), id)
+                                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                        }
+                    }
+                }
+            }
+        }
+        // commit the write transaction.
+        write_txn
+            .commit()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        Ok(())
     }
 
     // Function to implement basic metadata filtering.

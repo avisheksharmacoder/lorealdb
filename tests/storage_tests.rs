@@ -233,3 +233,51 @@ fn test_indexed_metadata_filtering_100k() {
         );
     });
 }
+
+#[test]
+fn test_upsert_index_cleanup_and_enrichment() {
+    pyo3::prepare_freethreaded_python();
+
+    let dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let db_path = dir.path().join("upsert_test.redb");
+    let engine = DBEngine::new(db_path.to_str().unwrap()).expect("Failed to initialize engine");
+
+    let id = "ticket_101";
+
+    // Step 1: Insert initial record
+    let initial_payload = b"{\"status\": \"open\", \"priority\": \"high\"}";
+    engine
+        .insert(id, initial_payload)
+        .expect("Initial insert failed");
+
+    // Step 2: Perform an Upsert modifying status and enriching data with an AI summary
+    let updated_payload =
+        b"{\"status\": \"closed\", \"priority\": \"high\", \"summary\": \"Resolved by AI agent.\"}";
+    engine
+        .upsert(id, updated_payload)
+        .expect("Upsert operation failed");
+
+    Python::with_gil(|py| {
+        // Assert the new payload is written successfully
+        let retrieved = engine.get(py, id).unwrap().unwrap();
+        let retrieved_str = std::str::from_utf8(retrieved.as_bytes()).unwrap();
+        assert!(retrieved_str.contains("closed"));
+        assert!(retrieved_str.contains("Resolved by AI agent."));
+
+        // Assert stale index key ("status:open") was successfully purged
+        let old_index_results = engine.filter_by_metadata(py, "status", "open").unwrap();
+        assert!(
+            !old_index_results.contains_key(id),
+            "Stale index key entry found! Upsert failed to purge the old index record."
+        );
+
+        // Assert new index keys match perfectly
+        let new_index_results = engine.filter_by_metadata(py, "status", "closed").unwrap();
+        assert!(new_index_results.contains_key(id));
+
+        let enriched_index_results = engine
+            .filter_by_metadata(py, "summary", "Resolved by AI agent.")
+            .unwrap();
+        assert!(enriched_index_results.contains_key(id));
+    });
+}
