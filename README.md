@@ -1,8 +1,6 @@
-# lorealdb
+# LorealDB: Open-Source High-Performance Embedded Python Database Engine
 
-# LorealDB: Open-Source High-Performance DBEngine
-
-**LorealDB** is an open-source, high-performance, read-optimized database engine built using Redb, Rust and exposed natively to Python. It stores JSON documents as raw bytes and automatically creates a background metadata index, allowing for lightning-fast querying and filtering without the overhead of heavy runtime parsing.
+**LorealDB** is an open-source, high-performance, read-optimized embedded database engine built using Redb, Rust and exposed natively to Python. It stores JSON documents as raw bytes and automatically creates a background metadata index, allowing for lightning-fast querying and filtering without the overhead of heavy runtime parsing.
 
 ## Features
 * **Dead Simple:** No configuration, no servers, no ports. Just point it to a file path and start saving data.
@@ -27,7 +25,7 @@ Install the package using your favorite Python package manager:
 
 If you write basic Python scripts and want to store and query JSON data, use the standard `DBEngine`. 
 
-> **Note:** `DBEngine` is read-optimized and strictly requires valid JSON data to automatically build a high-speed metadata index in the background.
+> **Note:** `DBEngine` is read-optimized and strictly requires JSON data in bytes to automatically build a high-speed metadata index in the background.
 
 ```python
 import json
@@ -50,6 +48,8 @@ if settings_bytes:
 
 # 4. Deleting a record
 db.delete("settings")
+
+```
 
 # LorealDB `DBEngine` Python API Reference
 
@@ -119,25 +119,6 @@ batch_data = [
 ]
 
 db.insert_many(batch_data)
-
-```
-
-### `insert_raw(id, payload)` & `insert_many_raw(records)`
-
-Bypasses the CPU-intensive JSON validation and metadata indexing steps. Use these *only* if you have already validated your JSON and do not need to query these documents using `filter_by_metadata`.
-
-* **Arguments:** Same as `insert` and `insert_many`.
-* **Returns:** `None`
-
-```python
-# Insert a single pre-validated raw byte payload
-db.insert_raw("doc_4", b'{"status": "archived"}')
-
-# Insert multiple pre-validated raw byte payloads
-db.insert_many_raw([
-    ("doc_5", b'{"status": "archived"}'),
-    ("doc_6", b'{"status": "deleted"}')
-])
 
 ```
 
