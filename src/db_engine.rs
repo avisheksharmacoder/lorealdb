@@ -407,23 +407,23 @@ impl DBEngine {
                         }
                     }
                 }
+            }
 
-                // now insert new payload into the table.
-                documents_table
-                    .insert(id, payload)
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            // now insert new payload into the table.
+            documents_table
+                .insert(id, payload)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-                // now populate the metadata indexing table with the new parsed json data.
-                if let Some(new_json_object) = new_parsed_json.as_object() {
-                    for (key, value) in new_json_object {
-                        if let Some(value_str) = value.as_str() {
-                            let new_key_value = format!("{}:{}", key, value_str);
+            // now populate the metadata indexing table with the new parsed json data.
+            if let Some(new_json_object) = new_parsed_json.as_object() {
+                for (key, value) in new_json_object {
+                    if let Some(value_str) = value.as_str() {
+                        let new_key_value = format!("{}:{}", key, value_str);
 
-                            // store the new key value and id into metadata indexingg table
-                            metadata_indexing_table
-                                .insert(new_key_value.as_str(), id)
-                                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                        }
+                        // store the new key value and id into metadata indexingg table
+                        metadata_indexing_table
+                            .insert(new_key_value.as_str(), id)
+                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                     }
                 }
             }
