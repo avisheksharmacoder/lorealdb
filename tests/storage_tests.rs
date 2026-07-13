@@ -1,4 +1,4 @@
-use lorealdb::DBEngine;
+use lorealdb::db_engine::DBEngine;
 use pyo3::prelude::*;
 use std::time::Instant;
 use tempfile::tempdir;
