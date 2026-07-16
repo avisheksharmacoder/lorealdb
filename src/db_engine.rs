@@ -1,7 +1,7 @@
 use crossbeam_channel::unbounded;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyDict};
 use redb::{Database, MultimapTable, MultimapTableDefinition, ReadableTable, TableDefinition};
 use simd_json::prelude::*;
 use simd_json::OwnedValue;
@@ -324,12 +324,8 @@ impl DBEngine {
     }
 
     // Insert many records into the Documents Table.
+    // We assume all records are valid Pydantic dict/json exports from Python.
     pub fn insert_many(&self, records: Vec<(String, Vec<u8>)>) -> PyResult<()> {
-        // create a mutable object to store the validated records, during the simd validation.
-        // This is done to save the parsed json for metadata filtering later.
-        let mut parsed_json_objects: Vec<(String, Vec<u8>, OwnedValue)> =
-            Vec::with_capacity(records.len());
-
         // Validate the entire batch data, before we try to open a DB Transaction.
         // if one of those item is not validated, we skip the insert.
         for (id, payload) in records {
@@ -405,7 +401,7 @@ impl DBEngine {
             .get(id)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
         {
-            return Ok(Some(PyBytes::new_bound(py, access_guard.value())));
+            return Ok(Some(PyBytes::new(py, access_guard.value())));
         } else {
             Ok(None)
         }
@@ -439,7 +435,7 @@ impl DBEngine {
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
             {
                 // add the id and access_guard value, if found from the table.
-                document_results.insert(id, Some(PyBytes::new_bound(py, access_guard.value())));
+                document_results.insert(id, Some(PyBytes::new(py, access_guard.value())));
             } else {
                 // add the id and None.
                 document_results.insert(id, None);
@@ -515,7 +511,7 @@ impl DBEngine {
             // if we find keys, insert it into the hashmap, the id and the bytes.
             results.insert(
                 current_key.to_string(),
-                PyBytes::new_bound(py, value_guard.value()),
+                PyBytes::new(py, value_guard.value()),
             );
         }
         Ok(results)
@@ -650,10 +646,7 @@ impl DBEngine {
                 .get(doc_id)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
             {
-                results.insert(
-                    doc_id.to_string(),
-                    PyBytes::new_bound(py, doc_guard.value()),
-                );
+                results.insert(doc_id.to_string(), PyBytes::new(py, doc_guard.value()));
             }
         }
         Ok(results)

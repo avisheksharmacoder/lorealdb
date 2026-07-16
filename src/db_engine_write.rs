@@ -106,7 +106,7 @@ impl DBEngineWriteOptimized {
             .get(id)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
         {
-            return Ok(Some(PyBytes::new_bound(py, access_guard.value())));
+            return Ok(Some(PyBytes::new(py, access_guard.value())));
         } else {
             Ok(None)
         }
@@ -140,7 +140,7 @@ impl DBEngineWriteOptimized {
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
             {
                 // add the id and access_guard value, if found from the table.
-                raw_document_results.insert(id, Some(PyBytes::new_bound(py, access_guard.value())));
+                raw_document_results.insert(id, Some(PyBytes::new(py, access_guard.value())));
             } else {
                 // add the id and None.
                 raw_document_results.insert(id, None);
@@ -216,7 +216,7 @@ impl DBEngineWriteOptimized {
             // if we find keys, insert it into the hashmap, the id and the bytes.
             raw_document_results.insert(
                 current_key.to_string(),
-                PyBytes::new_bound(py, value_guard.value()),
+                PyBytes::new(py, value_guard.value()),
             );
         }
         Ok(raw_document_results)
