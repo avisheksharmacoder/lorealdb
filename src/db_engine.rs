@@ -1,11 +1,94 @@
+use crossbeam_channel::unbounded;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use redb::{Database, MultimapTableDefinition, ReadableTable, TableDefinition};
+use redb::{Database, MultimapTable, MultimapTableDefinition, ReadableTable, TableDefinition};
 use simd_json::prelude::*;
 use simd_json::OwnedValue;
+use simd_json::StaticNode;
 use std::collections::HashMap;
+
+// import crossbeam-channel's Unbonded and Sender.
+use crossbeam_channel::Sender;
 use std::sync::Arc;
+use std::thread;
+
+// helper function to index the keys and values of the json payload.
+// it helps to deep nest all the fields for easy metadata filtering later.
+fn extract_index_from_json_payload(
+    prefix: String,
+    value: &OwnedValue,
+    id: &str,
+    metadata_table: &mut MultimapTable<'_, &'static str, &'static str>,
+) {
+    match value {
+        // if the object is json. Process the first key and recursively send the next payload
+        // again to the function to repeat the process until the end of the string.
+        OwnedValue::Object(obj) => {
+            for (json_key, json_value) in obj.iter() {
+                let new_prefix = if json_key.is_empty() {
+                    json_key.to_string()
+                } else {
+                    format!("{}.{}", prefix, json_key)
+                };
+                extract_index_from_json_payload(new_prefix, json_value, id, metadata_table);
+            }
+        }
+        // if the json value is an array. Index the array elements by their array.
+        // like
+        OwnedValue::Array(arr) => {
+            for (element_index, element_value) in arr.iter().enumerate() {
+                let new_prefix = format!("{}.{}", prefix, element_index);
+                extract_index_from_json_payload(new_prefix, element_value, id, metadata_table);
+            }
+        }
+        // if the json value is a string.
+        OwnedValue::String(string_value) => {
+            let index_key = format!("{}.{}", prefix, string_value);
+            let _ = metadata_table.insert(index_key.as_str(), id);
+        }
+
+        // if the json value is an int.
+        // We cannot use Integer or Float, these are not available. We have to use
+        // OwnedValue::Static with StaticNode::I64 or F64 for the proper datatype.
+        OwnedValue::Static(StaticNode::I64(integer_value)) => {
+            let index_key = format!("{}.{}", prefix, integer_value);
+            let _ = metadata_table.insert(index_key.as_str(), id);
+        }
+
+        // if the json value is a float.
+        OwnedValue::Static(StaticNode::F64(float_value)) => {
+            let index_key = format!("{}.{}", prefix, float_value);
+            let _ = metadata_table.insert(index_key.as_str(), id);
+        }
+
+        // if the json value is a slice of bytes. Use U64.
+        OwnedValue::Static(StaticNode::U64(bytes_value)) => {
+            let index_key = format!("{}.{}", prefix, bytes_value);
+            let _ = metadata_table.insert(index_key.as_str(), id);
+        }
+
+        // if the json value is a bool value.,
+        OwnedValue::Static(StaticNode::Bool(bool_value)) => {
+            let index_key = format!("{}.{}", prefix, bool_value);
+            let _ = metadata_table.insert(index_key.as_str(), id);
+        }
+
+        // if no other value is encountered, fall back.
+        _ => {}
+    }
+}
+
+// the struct containing id and payload(JSON) to send to the
+// cross beam channel for a different worker to handle metadata indexing
+// It contains the id as string and the payload a Vector of bytes.
+// ...................................................................
+// The data needs a struct of its own, as it is crossing boundaries and
+// the data needs to be owned first to travel across the channel and thread boundaries.
+struct MetadataIndexPayload {
+    id: String,
+    json_payload_bytes: Vec<u8>,
+}
 
 // Define the key table and log table for storing logs.
 // TableDefinition<K, V>, K is key, V is value. &str is ref to str, &[u8] has ref + size
@@ -15,10 +98,34 @@ const DOCUMENTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("docu
 const METADATA_TABLE: MultimapTableDefinition<&str, &str> =
     MultimapTableDefinition::new("metadata_index");
 
-// create the db engine.
+// create the Database engine.
+// add the sender payload so, the index is sent to a background worker to process it.
+// When sending data to the background worker, we need to send it in a vector of payloads,
+// whether it is one or many. We then write to the metadata table in one batch and one fsync
+// is only required. This takes more memory to hold a large amount of JSON payloads.
 #[pyclass]
 pub struct DBEngine {
     db: Arc<Database>,
+    indexing_transmitter: Sender<Vec<MetadataIndexPayload>>,
+}
+
+// A private method that will not be exposed to Python API.
+impl DBEngine {
+    // this function is used to send the json payload to the metadata filter processing
+    // function through the background worker.
+    fn dispatch_json_to_worker(&self, json_payload: Vec<MetadataIndexPayload>) -> PyResult<()> {
+        // if the payload is empty, we don't send anything to the channel.
+        if json_payload.is_empty() {
+            return Ok(());
+        }
+
+        // send the json payload to the background worker.
+        self.indexing_transmitter
+            .send(json_payload)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        Ok(())
+    }
 }
 
 #[pymethods]
@@ -30,7 +137,6 @@ impl DBEngine {
         let db = Database::create(path).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         // open a write transaction and create the tables if they dont exist.
-        // once created, commit the changes.
         let write_txn = db
             .begin_write()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -43,15 +149,76 @@ impl DBEngine {
                 .open_multimap_table(METADATA_TABLE)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         }
+
+        // once created, commit the changes.
         write_txn
             .commit()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
+        // Create the Arc db pointer for db here.
+        let db_arc = Arc::new(db);
+        let background_worker_db = db_arc.clone();
+
+        // Create the lock free channel to pass the json data around.
+        let (tx, rx) = unbounded::<Vec<MetadataIndexPayload>>();
+
+        // spawn the background worker thread, for processing the metadata of the json separately.
+        thread::spawn(move || {
+            // rx receiver now returns a vector of json payloads to process.
+            while let Ok(mut json_payload) = rx.recv() {
+                // we open one write transaction for the entire job, whether it has
+                // one json payload or many. Simd json can validate it in memory.
+                // Create the write transaction here.
+                if let Ok(db_write_trx) = background_worker_db.begin_write() {
+                    // Open the metadata documents table for storing json index.
+                    // The metadata table is a multimap table.
+                    if let Ok(mut metdata_table) = db_write_trx.open_multimap_table(METADATA_TABLE)
+                    {
+                        // Here, we process json payloads one by one from the vector.
+                        for json_doc in &mut json_payload {
+                            // We will use simd_json, validate all json before doing a write a commit to the
+                            // metadata table.
+                            // the mutable json bytes is a mutable reference which is 100% owwned in this thread.
+                            // We can modify it here as well if needed.
+                            match simd_json::to_owned_value(&mut json_doc.json_payload_bytes) {
+                                // Call the indexing helper funnction to process the payload.
+                                // The function will return the parsed payload here.
+                                Ok(parsed_json_payload) => {
+                                    // extract all the key hierarchies from the json
+                                    extract_index_from_json_payload(
+                                        String::new(),
+                                        &parsed_json_payload,
+                                        &json_doc.id,
+                                        &mut metdata_table,
+                                    );
+                                }
+                                // Return error if any error happens.
+                                Err(e) => {
+                                    println!(
+                                        "Metadata indexing failed for {}: {}",
+                                        &json_doc.id, e
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // commit the changes to the metadata indexing table.
+                    let _ = db_write_trx.commit();
+                }
+            }
+        });
+
         // return Self inside Ok()
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: db_arc,
+            indexing_transmitter: tx,
+        })
     }
 
     // Insert a new record into the Documents Table.
+    // for single insert, we dont need to send the json payload to buffer channel
+    // as the I/O time is big enough to negate the small indexing time.
     pub fn insert(&self, id: &str, payload: &[u8]) -> PyResult<()> {
         // make a mutable copy for simd_json to parse.
         let mut buffer: Vec<u8> = payload.to_vec();
@@ -105,6 +272,53 @@ impl DBEngine {
         write_txn
             .commit()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        Ok(())
+    }
+
+    // Insert a new json record into the documents table. The insert_json() method takes a json from python,
+    // or pydantic model_dumps() or json() output, converts it into bytes, parses and validates it using
+    // simd_json. It saves the record in the DOCUMENTS_TABLE and sends the parsed json to a different background
+    // worker to process it and insert into metadata indexing table for fast reads, search.
+    pub fn insert_json(&self, id: &str, json_payload: &str) -> PyResult<()> {
+        // create the json payload bytes here, to save it in DOCUMENTS TABLE.
+        let json_payload_bytes = json_payload.as_bytes();
+
+        // open a write txn for the documents table.
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        {
+            // Open the documents table.
+            let mut documents_table = write_txn
+                .open_table(DOCUMENTS_TABLE)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+            // insert the json bytes to the documents table.
+            documents_table
+                .insert(id, json_payload_bytes)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        }
+        // commit the changes to the database.
+        write_txn
+            .commit()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        // Now, here we trigger the background worker for the metadata processing to store the
+        // keys in the indexing table.
+        // we have to make a copy of the json bytes from Python, for simd_json to validate. it needs
+        // a mutable ref.
+        let index_job = MetadataIndexPayload {
+            id: id.to_string(),
+            json_payload_bytes: json_payload_bytes.to_vec(),
+        };
+
+        // now send the index_job to the non-blocking channel.
+        // since the dispatch function now expects a vector of json payloads to process,
+        // we send the json payload wrapped into a Vector.
+        self.dispatch_json_to_worker(vec![index_job])?;
 
         Ok(())
     }

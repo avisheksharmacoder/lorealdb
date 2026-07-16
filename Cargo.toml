@@ -12,6 +12,7 @@ crate-type = [ "cdylib", "rlib" ]
 [dependencies]
 redb = "2.1.1"
 simd-json = "0.13.0"
+crossbeam-channel = "0.5"
 
 
 [dependencies.pyo3]
