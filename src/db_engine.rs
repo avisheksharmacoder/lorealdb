@@ -222,59 +222,59 @@ impl DBEngine {
     // Insert a new record into the Documents Table.
     // for single insert, we dont need to send the json payload to buffer channel
     // as the I/O time is big enough to negate the small indexing time.
-    pub fn insert(&self, id: &str, payload: &[u8]) -> PyResult<()> {
-        // make a mutable copy for simd_json to parse.
-        let mut buffer: Vec<u8> = payload.to_vec();
+    pub fn insert<'py>(
+        &self,
+        _py: Python<'py>,
+        id: &str,
+        dict_payload: Bound<'py, PyDict>,
+    ) -> PyResult<()> {
+        // Serialize the PyDict payload from Python to rust bytes.
+        let dict_rust_value: Value = depythonize(&dict_payload).map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "Error converting dict to Rust bytes for {}.{}",
+                id, e
+            ))
+        })?;
 
         // validate and parse JSON data at CPU vector speeds.
         // if json is not valid, raise error to user.
-        let _parsed_json: OwnedValue = simd_json::to_owned_value(&mut buffer).map_err(|e| {
-            PyRuntimeError::new_err(format!("Invalid JSON payload for id {}: {}", id, e))
+        let buffer = simd_json::to_vec(&dict_rust_value).map_err(|e| {
+            PyRuntimeError::new_err(format!("Invalid json payload for {}.{}", id, e))
         })?;
 
-        // write to the disk if the json data is only valid.
+        // Insert the json payloads to the documents table once they are validated.
+        // Create a write transaction for documents table.
         let write_txn = self
             .db
             .begin_write()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         {
-            let mut tickets_table = write_txn
+            // open the documents table to write the json payload.
+            let mut documents_table = write_txn
                 .open_table(DOCUMENTS_TABLE)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-            // open metadata index table as well, to optimize read for future.
-            let mut metadata_index_table = write_txn
-                .open_multimap_table(METADATA_TABLE)
+            // insert the json payload.
+            documents_table
+                .insert(id, buffer.as_slice())
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            // re borrow the mutated payload variable, as an immutable
-            // for redb function.
-            tickets_table
-                .insert(id, &*payload)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            // we have to iterate through the JSON string and index all the string values
-            // into the metadata index table.
-            if let Some(json_object) = _parsed_json.as_object() {
-                for (key, value) in json_object {
-                    // for now index flat strings.
-                    if let Some(value_str) = value.as_str() {
-                        let key_value = format!("{}:{}", key, value_str);
-
-                        // insert the record into the metadata index table.
-                        // store in the key:Value : id format.
-                        metadata_index_table
-                            .insert(key_value.as_str(), id)
-                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                    }
-                }
-            }
         }
 
+        // commit the changes to the documents table.
         write_txn
             .commit()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        // Create the metadata index payload and send to the background worker
+        // to create the indexes and store in the metadata table.
+        // We pass the json bufefgr
+        let indexing_json_job = MetadataIndexPayload {
+            id: id.to_string(),
+            json_payload_bytes: buffer,
+        };
+
+        self.dispatch_json_to_worker(vec![indexing_json_job])?;
 
         Ok(())
     }
