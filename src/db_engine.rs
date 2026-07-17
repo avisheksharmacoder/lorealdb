@@ -344,12 +344,12 @@ impl DBEngine {
             // we first need to serialize them from PyDict to rust bytes.
             // The final value here is a rust serde_json value.
             let pydict_rust_bytes: Value = depythonize(&dict_payload)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(|e| PyRuntimeError::new_err(format!("Failed to serialize dict for {}.{}", id, e)))?;
 
             // convert the serde_json value to a rust bytes vector.
             let buffer = pydict_rust_bytes
                 .to_vec()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(|e| PyRuntimeError::new_err(format!("Failed to encode bytes for {}.{}", id, e)))?;
 
             // push the validated json payload to the valid_jobs vector.
             valid_jobs.push(MetadataIndexPayload{
