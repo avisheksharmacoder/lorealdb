@@ -8,6 +8,9 @@ use simd_json::OwnedValue;
 use simd_json::StaticNode;
 use std::collections::HashMap;
 
+use pythonize::depythonize;
+use serde_json::Value;
+
 // import crossbeam-channel's Unbonded and Sender.
 use crossbeam_channel::Sender;
 use std::sync::Arc;
@@ -324,66 +327,65 @@ impl DBEngine {
     }
 
     // Insert many records into the Documents Table.
-    // We assume all records are valid Pydantic dict/json exports from Python.
-    pub fn insert_many(&self, records: Vec<(String, Vec<u8>)>) -> PyResult<()> {
+    // All records are Pydantic dict, or normal dict from Python.
+    // We assume these dictionaries are not validated from user side.
+    // The user sends a list of tuples that have id, and its dictionary.
+    pub fn insert_many<'py>(
+        &self,
+        _py: Python<'py>,
+        records: Vec<(String, Bound<'py, PyDict)>
+    ) -> PyResult<()> {
+        // create a vector to store all the valid json jobs.
+        let mut valid_jobs = Vec::with_capacity(records.len());
+
         // Validate the entire batch data, before we try to open a DB Transaction.
         // if one of those item is not validated, we skip the insert.
-        for (id, payload) in records {
-            // create a mutable vector for simd_json to use.
-            let mut buffer: Vec<u8> = payload.to_vec();
+        for (id, dict_payload) in records {
+            // we first need to serialize them from PyDict to rust bytes.
+            // The final value here is a rust serde_json value.
+            let pydict_rust_bytes: Value = depythonize(&dict_payload)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-            let _parsed_json = simd_json::to_owned_value(&mut buffer).map_err(|e| {
-                PyRuntimeError::new_err(format!("Invalid json in batch for id {}: {}", id, e))
-            })?;
+            // convert the serde_json value to a rust bytes vector.
+            let buffer = pydict_rust_bytes
+                .to_vec()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-            // insert the validated json into the mutable vector object.
-            parsed_json_objects.push((id, payload, _parsed_json));
+            // push the validated json payload to the valid_jobs vector.
+            valid_jobs.push(MetadataIndexPayload{
+                id,
+                json_payload_bytes: buffer
+            });
         }
 
-        // Write to disk, if all the items of the batch data are valid.
+        // Create the write transaction to write the payload to the documents table.
         let write_txn = self
             .db
             .begin_write()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         {
-            // fetch the documents table.
-            let mut tickets_table = write_txn
+            // get the documents table from database.
+            let mut documents_table = write_txn
                 .open_table(DOCUMENTS_TABLE)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-            // fetch the metadata index table as well, to optimize read operations for future.
-            let mut metadata_index_table = write_txn
-                .open_multimap_table(METADATA_TABLE)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            for (id, payload, parsed_json) in parsed_json_objects {
-                tickets_table
-                    .insert(id.as_str(), payload.as_slice())
+            // insert the payloads one by one.
+            for json_data in valid_jobs {
+                documents_table
+                    .insert(json_data.id.as_str(), json_data.json_payload_bytes.as_str())
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-                // we have to iterate through the JSON string from the validated_record object and
-                // index all the string values into the metadata index table.
-                if let Some(json_object) = parsed_json.as_object() {
-                    for (key, value) in json_object {
-                        // for now index flat strings.
-                        if let Some(value_str) = value.as_str() {
-                            let key_value = format!("{}:{}", key, value_str);
-
-                            // insert the record into the metadata index table.
-                            // store in the key:Value : id format.
-                            metadata_index_table
-                                .insert(key_value.as_str(), id.as_str())
-                                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                        }
-                    }
-                }
             }
         }
 
+        // commit the changes to the database.
         write_txn
             .commit()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        // send the json_payload to the background worker.
+        self.dispatch_json_to_worker(valid_jobs)?;
+
         Ok(())
     }
 
