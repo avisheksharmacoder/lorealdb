@@ -284,9 +284,19 @@ impl DBEngine {
     // simd_json. It saves the record in the DOCUMENTS_TABLE and sends the parsed json to a different background
     // worker to process it and insert into metadata indexing table for fast reads, search.
     pub fn insert_json(&self, id: &str, json_payload: &str) -> PyResult<()> {
-        // create the json payload bytes here, to save it in DOCUMENTS TABLE.
-        let json_payload_bytes = json_payload.as_bytes();
+        // create a bytes payload for simd_json to validate it in the memory.
+        let mut buffer = json_payload.as_bytes().to_vec();
 
+        // validate and parse JSON data at CPU vector speeds.
+        // if json is not valid, raise error to user.
+        if let Err(e) = simd_json::to_owned_value(&mut buffer) {
+            return Err(PyRuntimeError::new_err(format!(
+                "Validation error for json payload id {}.{}",
+                id, e
+            )));
+        }
+
+        // Save the json payload to the documents table.
         // open a write txn for the documents table.
         let write_txn = self
             .db
@@ -294,14 +304,14 @@ impl DBEngine {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         {
-            // Open the documents table.
+            // Get the documents table.
             let mut documents_table = write_txn
                 .open_table(DOCUMENTS_TABLE)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-            // insert the json bytes to the documents table.
+            // insert the json payload as bytes to the documents table.
             documents_table
-                .insert(id, json_payload_bytes)
+                .insert(id, json_payload.as_bytes())
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         }
         // commit the changes to the database.
@@ -315,10 +325,10 @@ impl DBEngine {
         // a mutable ref.
         let index_job = MetadataIndexPayload {
             id: id.to_string(),
-            json_payload_bytes: json_payload_bytes.to_vec(),
+            json_payload_bytes: json_payload.as_bytes().to_vec(),
         };
 
-        // now send the index_job to the non-blocking channel.
+        // now send the json payload to the background worker.
         // since the dispatch function now expects a vector of json payloads to process,
         // we send the json payload wrapped into a Vector.
         self.dispatch_json_to_worker(vec![index_job])?;
