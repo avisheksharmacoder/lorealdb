@@ -373,7 +373,7 @@ impl DBEngine {
             // insert the payloads one by one.
             for json_data in valid_jobs {
                 documents_table
-                    .insert(json_data.id.as_str(), json_data.json_payload_bytes.as_str())
+                    .insert(json_data.id.as_str(), json_data.json_payload_bytes.as_slice())
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             }
         }
@@ -388,6 +388,70 @@ impl DBEngine {
 
         Ok(())
     }
+
+    // We process a payload of validated or invalidated jsons.
+    // These jsons can be a final output of pydantic dumps or dataclasses.
+    // We need to validate the json payload irrespective of where it comes from.
+    // As a user can send a list of good of bad unformatted json and we dont want our db to crash.
+
+    pub fn insert_many_json<'py>(&self, _py: Python<'py>, records: Vector<(String, String)>) -> PyResult<()> {
+        // create a vector to store all the valid json bytes.
+        let mut valid_jobs = Vec::with_capacity(records.len());
+
+        // Validate the entire batch data, before we try to open a DB Transaction.
+        // if one of those item is not validated, we skip the insert and send a error message back to Python.
+        for (id, json_payload) in records {
+            // convert the json value to a rust bytes.
+            let mut buffer = json_payload.into_bytes();
+
+            // validate the json in place, using simd_json.
+            if let Err(e) = simd_json::to_owned_value(&mut buffer){
+                return Err(PyRuntimeError::new_err(format!("Invalid json in payload for id {}.{}", id, e)));
+            }
+
+            // push the validated json payload to the valid_jobs vector.
+            valid_jobs.push(MetadataIndexPayload{
+                id,
+                json_payload_bytes: buffer
+            });
+        }
+
+        // Create the write transaction to write the payload to the documents table.
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        {
+            // get the documents table from database.
+            let mut documents_table = write_txn
+                .open_table(DOCUMENTS_TABLE)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+            // insert the payloads one by one.
+            for json_data in valid_jobs {
+                documents_table
+                    .insert(json_data.id.as_str(), json_data.json_payload_bytes.as_slice())
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            }
+        }
+
+        // commit the changes to the database.
+        write_txn
+            .commit()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        // send the json_payload to the background worker.
+        self.dispatch_json_to_worker(valid_jobs)?;
+
+        Ok(())
+    }
+
+
+
+
+
+    // insert method definitions end here.
 
     pub fn get<'py>(&self, py: Python<'py>, id: &str) -> PyResult<Option<Bound<'py, PyBytes>>> {
         let read_txn = self
