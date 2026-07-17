@@ -333,7 +333,7 @@ impl DBEngine {
     pub fn insert_many<'py>(
         &self,
         _py: Python<'py>,
-        records: Vec<(String, Bound<'py, PyDict)>
+        records: Vec<(String, Bound<'py, PyDict>)>,
     ) -> PyResult<()> {
         // create a vector to store all the valid json jobs.
         let mut valid_jobs = Vec::with_capacity(records.len());
@@ -343,18 +343,19 @@ impl DBEngine {
         for (id, dict_payload) in records {
             // we first need to serialize them from PyDict to rust bytes.
             // The final value here is a rust serde_json value.
-            let pydict_rust_bytes: Value = depythonize(&dict_payload)
-                .map_err(|e| PyRuntimeError::new_err(format!("Failed to serialize dict for {}.{}", id, e)))?;
+            let pydict_rust_bytes: Value = depythonize(&dict_payload).map_err(|e| {
+                PyRuntimeError::new_err(format!("Failed to serialize dict for {}.{}", id, e))
+            })?;
 
             // convert the serde_json value to a rust bytes vector.
-            let buffer = pydict_rust_bytes
-                .to_vec()
-                .map_err(|e| PyRuntimeError::new_err(format!("Failed to encode bytes for {}.{}", id, e)))?;
+            let buffer = serde_json::to_vec(&pydict_rust_bytes).map_err(|e| {
+                PyRuntimeError::new_err(format!("Failed to encode bytes for {}.{}", id, e))
+            })?;
 
             // push the validated json payload to the valid_jobs vector.
-            valid_jobs.push(MetadataIndexPayload{
+            valid_jobs.push(MetadataIndexPayload {
                 id,
-                json_payload_bytes: buffer
+                json_payload_bytes: buffer,
             });
         }
 
@@ -371,9 +372,12 @@ impl DBEngine {
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
             // insert the payloads one by one.
-            for json_data in valid_jobs {
+            for json_data in &valid_jobs {
                 documents_table
-                    .insert(json_data.id.as_str(), json_data.json_payload_bytes.as_slice())
+                    .insert(
+                        json_data.id.as_str(),
+                        json_data.json_payload_bytes.as_slice(),
+                    )
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             }
         }
@@ -394,7 +398,11 @@ impl DBEngine {
     // We need to validate the json payload irrespective of where it comes from.
     // As a user can send a list of good of bad unformatted json and we dont want our db to crash.
 
-    pub fn insert_many_json<'py>(&self, _py: Python<'py>, records: Vector<(String, String)>) -> PyResult<()> {
+    pub fn insert_many_json<'py>(
+        &self,
+        _py: Python<'py>,
+        records: Vec<(String, String)>,
+    ) -> PyResult<()> {
         // create a vector to store all the valid json bytes.
         let mut valid_jobs = Vec::with_capacity(records.len());
 
@@ -405,14 +413,17 @@ impl DBEngine {
             let mut buffer = json_payload.into_bytes();
 
             // validate the json in place, using simd_json.
-            if let Err(e) = simd_json::to_owned_value(&mut buffer){
-                return Err(PyRuntimeError::new_err(format!("Invalid json in payload for id {}.{}", id, e)));
+            if let Err(e) = simd_json::to_owned_value(&mut buffer) {
+                return Err(PyRuntimeError::new_err(format!(
+                    "Invalid json in payload for id {}.{}",
+                    id, e
+                )));
             }
 
             // push the validated json payload to the valid_jobs vector.
-            valid_jobs.push(MetadataIndexPayload{
+            valid_jobs.push(MetadataIndexPayload {
                 id,
-                json_payload_bytes: buffer
+                json_payload_bytes: buffer,
             });
         }
 
@@ -429,9 +440,12 @@ impl DBEngine {
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
             // insert the payloads one by one.
-            for json_data in valid_jobs {
+            for json_data in &valid_jobs {
                 documents_table
-                    .insert(json_data.id.as_str(), json_data.json_payload_bytes.as_slice())
+                    .insert(
+                        json_data.id.as_str(),
+                        json_data.json_payload_bytes.as_slice(),
+                    )
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             }
         }
@@ -446,10 +460,6 @@ impl DBEngine {
 
         Ok(())
     }
-
-
-
-
 
     // insert method definitions end here.
 
