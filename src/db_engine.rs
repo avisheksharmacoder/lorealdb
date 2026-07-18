@@ -495,11 +495,11 @@ impl DBEngine {
             .begin_read()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        let tickets_table = read_txn
+        let documents_table = read_txn
             .open_table(DOCUMENTS_TABLE)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        if let Some(access_guard) = tickets_table
+        if let Some(access_guard) = documents_table
             .get(id)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
         {
@@ -523,7 +523,7 @@ impl DBEngine {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         //  Fetch the data of the Documents table.
-        let tickets_table = read_txn
+        let documents_table = read_txn
             .open_table(DOCUMENTS_TABLE)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
@@ -532,7 +532,7 @@ impl DBEngine {
 
         // populate the hashmap with the result items.
         for id in ids {
-            if let Some(access_guard) = tickets_table
+            if let Some(access_guard) = documents_table
                 .get(id.as_str())
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
             {
@@ -554,11 +554,11 @@ impl DBEngine {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         let record_existed = {
-            let mut tickets_table = write_txn
+            let mut documents_table = write_txn
                 .open_table(DOCUMENTS_TABLE)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-            let removed_record = tickets_table
+            let removed_record = documents_table
                 .remove(id)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
@@ -585,7 +585,7 @@ impl DBEngine {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         // Get the Documents table.
-        let document_table = read_txn
+        let documents_table = read_txn
             .open_table(DOCUMENTS_TABLE)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
@@ -594,7 +594,7 @@ impl DBEngine {
 
         // create an iterator starting from the prefix to the end of the db
         // use range to create the iterator.
-        let table_iterator = document_table
+        let table_iterator = documents_table
             .range(prefix..)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
