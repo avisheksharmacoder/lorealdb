@@ -252,10 +252,9 @@ impl DBEngine {
             ))
         })?;
 
-        // validate and parse JSON data at CPU vector speeds.
-        // if json is not valid, raise error to user.
-        let buffer = simd_json::to_vec(&dict_rust_value).map_err(|e| {
-            PyRuntimeError::new_err(format!("Invalid json payload for {}.{}", id, e))
+        // convert the serde_json value to a rust bytes vector.
+        let buffer = serde_json::to_vec(&dict_rust_value).map_err(|e| {
+            PyRuntimeError::new_err(format!("Failed to encode bytes for {}.{}", id, e))
         })?;
 
         // Insert the json payloads to the documents table once they are validated.
