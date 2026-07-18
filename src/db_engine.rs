@@ -18,70 +18,85 @@ use std::thread;
 
 // helper function to index the keys and values of the json payload.
 // it helps to deep nest all the fields for easy metadata filtering later.
-fn extract_index_from_json_payload(
+// Unified helper function to traverse JSON and either insert or remove metadata indexes.
+// Pass `is_insert = true` for adding indexes, and `false` for deleting them from the
+// metadata indexing table.
+fn process_json_index(
     prefix: String,
     value: &OwnedValue,
     id: &str,
     metadata_table: &mut MultimapTable<'_, &'static str, &'static str>,
+    is_insert: bool,
 ) {
+    // This is a quick inline closure to handle the DB operation.
+    // We dont need to write the if/else block in every single data type match arm.
+    let mut update_db = |index_key: String| {
+        if is_insert {
+            // if is_insert is True, insert the keys into the table.
+            let _ = metadata_table.insert(index_key.as_str(), id);
+        } else {
+            // if is_insert is False, remove the keys from the table.
+            let _ = metadata_table.remove(index_key.as_str(), id);
+        }
+    };
+
+    // We use match value to find the type of json value in a KV pair,
+    // and appropriately process the data type.
     match value {
-        // if the object is json. Process the first key and recursively send the next payload
-        // again to the function to repeat the process until the end of the string.
+        // if the value of the json doc is a json.
         OwnedValue::Object(obj) => {
             for (json_key, json_value) in obj.iter() {
                 let new_prefix = if json_key.is_empty() {
                     json_key.to_string()
                 } else {
+                    // If json = {"a": "b"}, then prefix key = "a.b"
+                    // final map stored in multimap table = "a.b" -> ["id"]
                     format!("{}.{}", prefix, json_key)
                 };
-                extract_index_from_json_payload(new_prefix, json_value, id, metadata_table);
+                // recursively process the next json, if the value is a json again.
+                process_json_index(new_prefix, json_value, id, metadata_table, is_insert);
             }
         }
-        // if the json value is an array. Index the array elements by their array.
-        // like
+
+        // if the json value is an array, we need loop again.
         OwnedValue::Array(arr) => {
             for (element_index, element_value) in arr.iter().enumerate() {
                 let new_prefix = format!("{}.{}", prefix, element_index);
-                extract_index_from_json_payload(new_prefix, element_value, id, metadata_table);
+                // recursively process the json in the array.
+                process_json_index(new_prefix, element_value, id, metadata_table, is_insert);
             }
         }
-        // if the json value is a string.
+
+        // if the json value is a String value.
         OwnedValue::String(string_value) => {
-            let index_key = format!("{}.{}", prefix, string_value);
-            let _ = metadata_table.insert(index_key.as_str(), id);
+            // update_db takes the data, inserts the data into the multimap table
+            // if is_insert = True.
+            // Else, it will delete the data, if is_insert = False.
+            update_db(format!("{}.{}", prefix, string_value));
         }
 
-        // if the json value is an int.
-        // We cannot use Integer or Float, these are not available. We have to use
-        // OwnedValue::Static with StaticNode::I64 or F64 for the proper datatype.
+        // if the json value is a integer.
         OwnedValue::Static(StaticNode::I64(integer_value)) => {
-            let index_key = format!("{}.{}", prefix, integer_value);
-            let _ = metadata_table.insert(index_key.as_str(), id);
+            update_db(format!("{}.{}", prefix, integer_value));
         }
 
-        // if the json value is a float.
+        // if the json value is a Float.
         OwnedValue::Static(StaticNode::F64(float_value)) => {
-            let index_key = format!("{}.{}", prefix, float_value);
-            let _ = metadata_table.insert(index_key.as_str(), id);
+            update_db(format!("{}.{}", prefix, float_value));
         }
 
-        // if the json value is a slice of bytes. Use U64.
+        // if the json value is a slice of bytes.
         OwnedValue::Static(StaticNode::U64(bytes_value)) => {
-            let index_key = format!("{}.{}", prefix, bytes_value);
-            let _ = metadata_table.insert(index_key.as_str(), id);
+            update_db(format!("{}.{}", prefix, bytes_value));
         }
 
-        // if the json value is a bool value.,
+        // if the jsob value is a boolean.
         OwnedValue::Static(StaticNode::Bool(bool_value)) => {
-            let index_key = format!("{}.{}", prefix, bool_value);
-            let _ = metadata_table.insert(index_key.as_str(), id);
+            update_db(format!("{}.{}", prefix, bool_value));
         }
-
-        // if no other value is encountered, fall back.
         _ => {}
     }
 }
-
 // the struct containing id and payload(JSON) to send to the
 // cross beam channel for a different worker to handle metadata indexing
 // It contains the id as string and the payload a Vector of bytes.
@@ -188,11 +203,12 @@ impl DBEngine {
                                 // The function will return the parsed payload here.
                                 Ok(parsed_json_payload) => {
                                     // extract all the key hierarchies from the json
-                                    extract_index_from_json_payload(
+                                    process_json_index(
                                         String::new(),
                                         &parsed_json_payload,
                                         &json_doc.id,
                                         &mut metdata_table,
+                                        true,
                                     );
                                 }
                                 // Return error if any error happens.
@@ -471,7 +487,7 @@ impl DBEngine {
         Ok(())
     }
 
-    // insert method definitions end here.
+    // insert method definitions end here. /////////////////////////////////////////////////////////////
 
     pub fn get<'py>(&self, py: Python<'py>, id: &str) -> PyResult<Option<Bound<'py, PyBytes>>> {
         let read_txn = self
