@@ -720,7 +720,7 @@ impl DBEngine {
         py: Python<'py>,
         index_key: &str,
         index_value: &str,
-    ) -> PyResult<HashMap<String, Bound<'py, PyBytes>>> {
+    ) -> PyResult<Vec<(String, Bound<'py, PyBytes>)>> {
         // create a read transaction.
         let read_txn = self
             .db
@@ -742,7 +742,7 @@ impl DBEngine {
         let search_term_formatted = format!("{}.{}", index_key, index_value);
 
         // create the results hashmap to send to Python after data processing.
-        let mut results = HashMap::new();
+        let mut results = Vec::new();
 
         // fetch all the matching document IDs from the index table, which needs to be implemented at
         // insert time for the documents table. This introduces a write time slowness but this is a Read
@@ -762,7 +762,7 @@ impl DBEngine {
                 .get(doc_id)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
             {
-                results.insert(doc_id.to_string(), PyBytes::new(py, doc_guard.value()));
+                results.push((doc_id.to_string(), PyBytes::new(py, doc_guard.value())));
             }
         }
         Ok(results)
