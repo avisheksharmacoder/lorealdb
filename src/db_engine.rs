@@ -547,6 +547,9 @@ impl DBEngine {
         Ok(document_results)
     }
 
+    // Delete the record from the documents table.
+    // Also, find all the indexes of the record in the metadata indexing
+    // table and delete them in one transaction.
     pub fn delete(&self, id: &str) -> PyResult<bool> {
         let write_txn = self
             .db
@@ -558,15 +561,39 @@ impl DBEngine {
                 .open_table(DOCUMENTS_TABLE)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
+            let mut metadata_indexing_table = write_txn
+                .open_multimap_table(METADATA_TABLE)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
             let removed_record = documents_table
                 .remove(id)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-            removed_record.is_some()
+            // if the document existed, clean up its metadata as well.
+            if let Some(record) = removed_record {
+                // generate the bytes of the deleted document using simd_json.
+                // We need the json bytes to generate the indexes of the document.
+                // to delete them from the metadata indexing table.
+                let mut buffer = record.value().to_vec();
+                if let Ok(parsed_json) = simd_json::to_owned_value(&mut buffer) {
+                    // call the process json index function to delete the indexes.
+                    process_json_index(
+                        String::new(),
+                        &parsed_json,
+                        id,
+                        &mut metadata_indexing_table,
+                        false,
+                    );
+                }
+                true
+            } else {
+                false
+            }
         };
         write_txn
             .commit()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
         Ok(record_existed)
     }
 
