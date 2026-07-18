@@ -1,4 +1,5 @@
 use crossbeam_channel::unbounded;
+use crossbeam_channel::RecvTimeoutError;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
@@ -15,6 +16,7 @@ use serde_json::Value;
 use crossbeam_channel::Sender;
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 // helper function to index the keys and values of the json payload.
 // it helps to deep nest all the fields for easy metadata filtering later.
@@ -124,7 +126,7 @@ const METADATA_TABLE: MultimapTableDefinition<&str, &str> =
 #[pyclass]
 pub struct DBEngine {
     db: Arc<Database>,
-    indexing_transmitter: Sender<Vec<MetadataIndexPayload>>,
+    indexing_transmitter: Sender<MetadataIndexPayload>,
 }
 
 // A private method that will not be exposed to Python API.
@@ -137,10 +139,12 @@ impl DBEngine {
             return Ok(());
         }
 
-        // send the json payload to the background worker.
-        self.indexing_transmitter
-            .send(json_payload)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        // Loop and send the json payload to the background worker.
+        for json_data in json_payload {
+            self.indexing_transmitter
+                .send(json_data)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        }
 
         Ok(())
     }
@@ -178,52 +182,84 @@ impl DBEngine {
         let background_worker_db = db_arc.clone();
 
         // Create the lock free channel to pass the json data around.
-        let (tx, rx) = unbounded::<Vec<MetadataIndexPayload>>();
+        let (tx, rx) = unbounded::<MetadataIndexPayload>();
 
         // spawn the background worker thread, for processing the metadata of the json separately.
         thread::spawn(move || {
-            // rx receiver now returns a vector of json payloads to process.
-            while let Ok(mut json_payload) = rx.recv() {
-                // we open one write transaction for the entire job, whether it has
-                // one json payload or many. Simd json can validate it in memory.
-                // Create the write transaction here.
-                if let Ok(db_write_trx) = background_worker_db.begin_write() {
-                    // Open the metadata documents table for storing json index.
-                    // The metadata table is a multimap table.
-                    if let Ok(mut metdata_table) = db_write_trx.open_multimap_table(METADATA_TABLE)
-                    {
-                        // Here, we process json payloads one by one from the vector.
-                        for json_doc in &mut json_payload {
-                            // We will use simd_json, validate all json before doing a write a commit to the
-                            // metadata table.
-                            // the mutable json bytes is a mutable reference which is 100% owwned in this thread.
-                            // We can modify it here as well if needed.
-                            match simd_json::to_owned_value(&mut json_doc.json_payload_bytes) {
-                                // Call the indexing helper funnction to process the payload.
-                                // The function will return the parsed payload here.
-                                Ok(parsed_json_payload) => {
-                                    // extract all the key hierarchies from the json
-                                    process_json_index(
-                                        String::new(),
-                                        &parsed_json_payload,
-                                        &json_doc.id,
-                                        &mut metdata_table,
-                                        true,
-                                    );
-                                }
-                                // Return error if any error happens.
-                                Err(e) => {
-                                    println!(
-                                        "Metadata indexing failed for {}: {}",
-                                        &json_doc.id, e
-                                    );
-                                }
+            // create the batch time of 10ms.
+            let queue_batch_time = Duration::from_millis(10);
+
+            // We pre-allocate the master batch size in the heap, so resizing does not happen
+            // at odd times or during spikes with large amount of payloads.
+            let mut master_batch = Vec::with_capacity(10000);
+
+            loop {
+                // We wait for the first batch of json payloads at 10ms timeout.
+                match rx.recv_timeout(queue_batch_time) {
+                    Ok(initial_payload) => {
+                        master_batch.push(initial_payload);
+
+                        // We drain remaning payloads from the queue that may be smaller than 10,000
+                        while let Ok(pending_payloads) = rx.try_recv() {
+                            master_batch.push(pending_payloads);
+                            // We need to set a limit to how many payloads can be put
+                            // into the master branch.
+                            if master_batch.len() >= 10000 {
+                                break;
                             }
                         }
-                    }
 
-                    // commit the changes to the metadata indexing table.
-                    let _ = db_write_trx.commit();
+                        // Continue wit the metadata indexing logic.
+                        if let Ok(db_write_trx) = background_worker_db.begin_write() {
+                            // Open the metadata documents table for storing json index.
+                            // The metadata table is a multimap table.
+                            if let Ok(mut metdata_indexing_table) =
+                                db_write_trx.open_multimap_table(METADATA_TABLE)
+                            {
+                                // Here, we process json payloads one by one from the vector.
+                                for json_doc in &mut master_batch {
+                                    // We will use simd_json, validate all json before doing a write a commit to the
+                                    // metadata table.
+                                    // the mutable json bytes is a mutable reference which is 100% owwned in this thread.
+                                    // We can modify it here as well if needed.
+                                    match simd_json::to_owned_value(
+                                        &mut json_doc.json_payload_bytes,
+                                    ) {
+                                        // Call the indexing helper funnction to process the payload.
+                                        // The function will return the parsed payload here.
+                                        Ok(parsed_json_payload) => {
+                                            // extract all the key hierarchies from the json
+                                            process_json_index(
+                                                String::new(),
+                                                &parsed_json_payload,
+                                                &json_doc.id,
+                                                &mut metdata_indexing_table,
+                                                true,
+                                            );
+                                        }
+                                        // Return error if any error happens.
+                                        Err(e) => {
+                                            println!(
+                                                "Metadata indexing failed for {}: {}",
+                                                &json_doc.id, e
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+
+                            // commit the changes to the metadata indexing table.
+                            let _ = db_write_trx.commit();
+                        }
+                        // clearr the master batch vector for the next batch of payloads.
+                        master_batch.clear();
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        continue;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        break;
+                    }
                 }
             }
         });
