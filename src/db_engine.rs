@@ -611,7 +611,7 @@ impl DBEngine {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         // create a hashmap to return the results into.
-        let mut results = HashMap::new();
+        let mut results = Vec::new();
 
         // create an iterator starting from the prefix to the end of the db
         // use range to create the iterator.
@@ -632,10 +632,10 @@ impl DBEngine {
             }
 
             // if we find keys, insert it into the hashmap, the id and the bytes.
-            results.insert(
+            results.push((
                 current_key.to_string(),
                 PyBytes::new(py, value_guard.value()),
-            );
+            ));
         }
         Ok(results)
     }
