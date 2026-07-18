@@ -252,6 +252,7 @@ dependencies = [
  "pyo3",
  "pythonize",
  "redb",
+ "serde",
  "serde_json",
  "simd-json",
  "tempfile",

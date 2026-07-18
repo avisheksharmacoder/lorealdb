@@ -4,7 +4,6 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use redb::{Database, MultimapTable, MultimapTableDefinition, ReadableTable, TableDefinition};
 use simd_json::prelude::*;
-use simd_json::ErrorType::Parser;
 use simd_json::OwnedValue;
 use simd_json::StaticNode;
 use std::collections::HashMap;
@@ -301,14 +300,11 @@ impl DBEngine {
     // simd_json. It saves the record in the DOCUMENTS_TABLE and sends the parsed json to a different background
     // worker to process it and insert into metadata indexing table for fast reads, search.
     pub fn insert_json(&self, id: &str, json_payload: &str) -> PyResult<()> {
-        // create a bytes payload for simd_json to validate it in the memory.
-        let mut buffer = json_payload.as_bytes().to_vec();
-
-        // validate and parse JSON data at CPU vector speeds.
+        // validate and parse JSON data using serde_json.
         // if json is not valid, raise error to user.
-        if let Err(e) = simd_json::to_owned_value(&mut buffer) {
+        if let Err(e) = serde_json::from_str::<serde::de::IgnoredAny>(json_payload) {
             return Err(PyRuntimeError::new_err(format!(
-                "Validation error for json payload id {}.{}",
+                "Validation error at {}.{}",
                 id, e
             )));
         }
