@@ -432,11 +432,8 @@ impl DBEngine {
         // Validate the entire batch data, before we try to open a DB Transaction.
         // if one of those item is not validated, we skip the insert and send a error message back to Python.
         for (id, json_payload) in records {
-            // convert the json value to a rust bytes.
-            let mut buffer = json_payload.into_bytes();
-
             // validate the json in place, using simd_json.
-            if let Err(e) = simd_json::to_owned_value(&mut buffer) {
+            if let Err(e) = serde_json::from_str::<serde::de::IgnoredAny>(&json_payload) {
                 return Err(PyRuntimeError::new_err(format!(
                     "Invalid json in payload for id {}.{}",
                     id, e
@@ -446,7 +443,7 @@ impl DBEngine {
             // push the validated json payload to the valid_jobs vector.
             valid_jobs.push(MetadataIndexPayload {
                 id,
-                json_payload_bytes: buffer,
+                json_payload_bytes: json_payload.as_bytes().to_vec(),
             });
         }
 
@@ -601,7 +598,7 @@ impl DBEngine {
         &self,
         py: Python<'py>,
         prefix: &str,
-    ) -> PyResult<HashMap<String, Bound<'py, PyBytes>>> {
+    ) -> PyResult<Vec<(String, Bound<'py, PyBytes>)>> {
         // Create a read transaction from the DB Engine.
         let read_txn = self
             .db
