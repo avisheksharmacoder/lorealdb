@@ -709,7 +709,7 @@ impl DBEngine {
             if let Some(new_json_object) = new_parsed_json.as_object() {
                 for (key, value) in new_json_object {
                     if let Some(value_str) = value.as_str() {
-                        let new_key_value = format!("{}:{}", key, value_str);
+                        let new_key_value = format!("{}.{}", key, value_str);
 
                         // store the new key value and id into metadata indexingg table
                         metadata_indexing_table
@@ -752,7 +752,7 @@ impl DBEngine {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         // format the search term into key:value format.
-        let search_term_formatted = format!("{}:{}", index_key, index_value);
+        let search_term_formatted = format!("{}.{}", index_key, index_value);
 
         // create the results hashmap to send to Python after data processing.
         let mut results = HashMap::new();
