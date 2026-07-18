@@ -4,6 +4,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use redb::{Database, MultimapTable, MultimapTableDefinition, ReadableTable, TableDefinition};
 use simd_json::prelude::*;
+use simd_json::ErrorType::Parser;
 use simd_json::OwnedValue;
 use simd_json::StaticNode;
 use std::collections::HashMap;
@@ -685,18 +686,16 @@ impl DBEngine {
                 .map(|guard| guard.value().to_vec());
 
             // check if an existing record is available or not.
+            // if available, we remove all the old records.
             if let Some(mut old_buffer) = old_data_opt {
                 if let Ok(old_parsed_json) = simd_json::to_owned_value(&mut old_buffer) {
-                    if let Some(old_json_object) = old_parsed_json.as_object() {
-                        for (key, value) in old_json_object {
-                            if let Some(value_str) = value.as_str() {
-                                let old_key_value = format!("{}:{}", key, value_str);
-
-                                // remove the value for this specific id only from the metadata indexing table.
-                                let _ = metadata_indexing_table.remove(old_key_value.as_str(), id);
-                            }
-                        }
-                    }
+                    process_json_index(
+                        String::new(),
+                        &old_parsed_json,
+                        id,
+                        &mut metadata_indexing_table,
+                        false,
+                    );
                 }
             }
 
@@ -706,18 +705,13 @@ impl DBEngine {
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
             // now populate the metadata indexing table with the new parsed json data.
-            if let Some(new_json_object) = new_parsed_json.as_object() {
-                for (key, value) in new_json_object {
-                    if let Some(value_str) = value.as_str() {
-                        let new_key_value = format!("{}.{}", key, value_str);
-
-                        // store the new key value and id into metadata indexingg table
-                        metadata_indexing_table
-                            .insert(new_key_value.as_str(), id)
-                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                    }
-                }
-            }
+            process_json_index(
+                String::new(),
+                &new_parsed_json,
+                id,
+                &mut metadata_indexing_table,
+                true,
+            );
         }
         // commit the write transaction.
         write_txn
