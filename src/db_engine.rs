@@ -426,22 +426,27 @@ impl DBEngine {
     // insert method definitions end here. /////////////////////////////////////////////////////////////
 
     pub fn get<'py>(&self, py: Python<'py>, id: &str) -> PyResult<Option<Bound<'py, PyBytes>>> {
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let db_result: Result<Option<Vec<u8>>, PyRuntimeError> = py.allow_threads(|| {
+            let read_txn = self
+                .db
+                .begin_read()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let documents_table = read_txn
+                .open_table(DOCUMENTS_TABLE)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        let documents_table = read_txn
-            .open_table(DOCUMENTS_TABLE)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        if let Some(access_guard) = documents_table
-            .get(id)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-        {
-            return Ok(Some(PyBytes::new(py, access_guard.value())));
-        } else {
-            Ok(None)
+            if let Some(access_guard) = documents_table
+                .get(id)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+            {
+                Ok(Some(access_guard.value().to_vec()))
+            } else {
+                Ok(None)
+            }
+        });
+        match db_result? {
+            Some(bytes) => Ok(Some(PyBytes::new(py, &bytes))),
+            None => Ok(None),
         }
     }
 
