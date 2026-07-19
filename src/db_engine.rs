@@ -8,7 +8,6 @@ use simd_json::prelude::*;
 use simd_json::OwnedValue;
 use simd_json::StaticNode;
 use std::collections::HashMap;
-use std::net::Shutdown::Write;
 
 use pythonize::depythonize;
 use serde_json::Value;
@@ -100,16 +99,6 @@ fn process_json_index(
         _ => {}
     }
 }
-// the struct containing id and payload(JSON) to send to the
-// cross beam channel for a different worker to handle metadata indexing
-// It contains the id as string and the payload a Vector of bytes.
-// ...................................................................
-// The data needs a struct of its own, as it is crossing boundaries and
-// the data needs to be owned first to travel across the channel and thread boundaries.
-struct MetadataIndexPayload {
-    id: String,
-    json_payload_bytes: Vec<u8>,
-}
 
 // Define the key table and log table for storing logs.
 // TableDefinition<K, V>, K is key, V is value. &str is ref to str, &[u8] has ref + size
@@ -137,27 +126,6 @@ enum WriteOp {
 pub struct DBEngine {
     db: Arc<Database>,
     write_txn: Sender<WriteOp>,
-}
-
-// A private method that will not be exposed to Python API.
-impl DBEngine {
-    // this function is used to send the json payload to the metadata filter processing
-    // function through the background worker.
-    fn dispatch_json_to_worker(&self, json_payload: Vec<MetadataIndexPayload>) -> PyResult<()> {
-        // if the payload is empty, we don't send anything to the channel.
-        if json_payload.is_empty() {
-            return Ok(());
-        }
-
-        // Loop and send the json payload to the background worker.
-        for json_data in json_payload {
-            self.indexing_transmitter
-                .send(json_data)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        }
-
-        Ok(())
-    }
 }
 
 #[pymethods]
@@ -347,39 +315,14 @@ impl DBEngine {
             PyRuntimeError::new_err(format!("Failed to encode bytes for {}.{}", id, e))
         })?;
 
-        // Insert the json payloads to the documents table once they are validated.
-        // Create a write transaction for documents table.
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        {
-            // open the documents table to write the json payload.
-            let mut documents_table = write_txn
-                .open_table(DOCUMENTS_TABLE)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            // insert the json payload.
-            documents_table
-                .insert(id, buffer.as_slice())
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        }
-
-        // commit the changes to the documents table.
-        write_txn
-            .commit()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        // Create the metadata index payload and send to the background worker
-        // to create the indexes and store in the metadata table.
-        // We pass the json bufefgr
-        let indexing_json_job = MetadataIndexPayload {
+        // create operation for insert and send it to the channel.
+        let op = WriteOp::Insert {
             id: id.to_string(),
-            json_payload_bytes: buffer,
+            payload: buffer,
         };
-
-        self.dispatch_json_to_worker(vec![indexing_json_job])?;
+        self.write_txn
+            .send(op)
+            .map_err(|e| PyRuntimeError::new_err(format!("Write queue full or closed. {}", e)))?;
 
         Ok(())
     }
@@ -419,9 +362,6 @@ impl DBEngine {
         _py: Python<'py>,
         records: Vec<(String, Bound<'py, PyDict>)>,
     ) -> PyResult<()> {
-        // create a vector to store all the valid json jobs.
-        let mut valid_jobs = Vec::with_capacity(records.len());
-
         // Validate the entire batch data, before we try to open a DB Transaction.
         // if one of those item is not validated, we skip the insert.
         for (id, dict_payload) in records {
@@ -436,43 +376,15 @@ impl DBEngine {
                 PyRuntimeError::new_err(format!("Failed to encode bytes for {}.{}", id, e))
             })?;
 
-            // push the validated json payload to the valid_jobs vector.
-            valid_jobs.push(MetadataIndexPayload {
-                id,
-                json_payload_bytes: buffer,
-            });
+            let op = WriteOp::Insert {
+                id: id.to_string(),
+                payload: buffer,
+            };
+
+            self.write_txn.send(op).map_err(|e| {
+                PyRuntimeError::new_err(format!("Write queue full or closed. {}", e))
+            })?;
         }
-
-        // Create the write transaction to write the payload to the documents table.
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        {
-            // get the documents table from database.
-            let mut documents_table = write_txn
-                .open_table(DOCUMENTS_TABLE)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            // insert the payloads one by one.
-            for json_data in &valid_jobs {
-                documents_table
-                    .insert(
-                        json_data.id.as_str(),
-                        json_data.json_payload_bytes.as_slice(),
-                    )
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            }
-        }
-
-        // commit the changes to the database.
-        write_txn
-            .commit()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        // send the json_payload to the background worker.
-        self.dispatch_json_to_worker(valid_jobs)?;
 
         Ok(())
     }
@@ -487,9 +399,6 @@ impl DBEngine {
         _py: Python<'py>,
         records: Vec<(String, String)>,
     ) -> PyResult<()> {
-        // create a vector to store all the valid json bytes.
-        let mut valid_jobs = Vec::with_capacity(records.len());
-
         // Validate the entire batch data, before we try to open a DB Transaction.
         // if one of those item is not validated, we skip the insert and send a error message back to Python.
         for (id, json_payload) in records {
@@ -501,43 +410,15 @@ impl DBEngine {
                 )));
             }
 
-            // push the validated json payload to the valid_jobs vector.
-            valid_jobs.push(MetadataIndexPayload {
-                id,
-                json_payload_bytes: json_payload.as_bytes().to_vec(),
-            });
+            let op = WriteOp::Insert {
+                id: id.to_string(),
+                payload: json_payload.as_bytes().to_vec(),
+            };
+
+            self.write_txn.send(op).map_err(|e| {
+                PyRuntimeError::new_err(format!("Write queue full or closed. {}", e))
+            })?;
         }
-
-        // Create the write transaction to write the payload to the documents table.
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        {
-            // get the documents table from database.
-            let mut documents_table = write_txn
-                .open_table(DOCUMENTS_TABLE)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            // insert the payloads one by one.
-            for json_data in &valid_jobs {
-                documents_table
-                    .insert(
-                        json_data.id.as_str(),
-                        json_data.json_payload_bytes.as_slice(),
-                    )
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            }
-        }
-
-        // commit the changes to the database.
-        write_txn
-            .commit()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        // send the json_payload to the background worker.
-        self.dispatch_json_to_worker(valid_jobs)?;
 
         Ok(())
     }
