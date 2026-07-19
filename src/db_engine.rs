@@ -1,4 +1,4 @@
-use crossbeam_channel::unbounded;
+use crossbeam_channel::bounded;
 use crossbeam_channel::RecvTimeoutError;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -8,6 +8,7 @@ use simd_json::prelude::*;
 use simd_json::OwnedValue;
 use simd_json::StaticNode;
 use std::collections::HashMap;
+use std::net::Shutdown::Write;
 
 use pythonize::depythonize;
 use serde_json::Value;
@@ -118,15 +119,24 @@ const DOCUMENTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("docu
 const METADATA_TABLE: MultimapTableDefinition<&str, &str> =
     MultimapTableDefinition::new("metadata_index");
 
+// We define the WriteOp Enum.
+// This is the universal instruction set from Python to the Master Writer.
+enum WriteOp {
+    Insert { id: String, payload: Vec<u8> },
+    Delete { id: String },
+    Upsert { id: String, payload: Vec<u8> },
+}
+
 // create the Database engine.
 // add the sender payload so, the index is sent to a background worker to process it.
 // When sending data to the background worker, we need to send it in a vector of payloads,
 // whether it is one or many. We then write to the metadata table in one batch and one fsync
 // is only required. This takes more memory to hold a large amount of JSON payloads.
+// We add the WriteOp to the DB Engine to use it.
 #[pyclass]
 pub struct DBEngine {
     db: Arc<Database>,
-    indexing_transmitter: Sender<MetadataIndexPayload>,
+    write_txn: Sender<WriteOp>,
 }
 
 // A private method that will not be exposed to Python API.
@@ -181,10 +191,12 @@ impl DBEngine {
         let db_arc = Arc::new(db);
         let background_worker_db = db_arc.clone();
 
-        // Create the lock free channel to pass the json data around.
-        let (tx, rx) = unbounded::<MetadataIndexPayload>();
+        // Create a bounded FIFO channel of size 10,000. If fastapi brings in 100,000K requests
+        // the channel will not accept them and go into OOM. It will hold from the fastapi side.
+        let (tx, rx) = bounded::<WriteOp>(10000);
 
         // spawn the background worker thread, for processing the metadata of the json separately.
+        // We implement a master write, to handle the disk operations in 3 types.
         thread::spawn(move || {
             // create the batch time of 10ms.
             let queue_batch_time = Duration::from_millis(10);
@@ -196,60 +208,102 @@ impl DBEngine {
             loop {
                 // We wait for the first batch of json payloads at 10ms timeout.
                 match rx.recv_timeout(queue_batch_time) {
-                    Ok(initial_payload) => {
-                        master_batch.push(initial_payload);
+                    Ok(db_op) => {
+                        master_batch.push(db_op);
 
                         // We drain remaning payloads from the queue that may be smaller than 10,000
-                        while let Ok(pending_payloads) = rx.try_recv() {
-                            master_batch.push(pending_payloads);
-                            // We need to set a limit to how many payloads can be put
-                            // into the master branch.
+                        while let Ok(pending_op) = rx.try_recv() {
+                            master_batch.push(pending_op);
+                            // limit to how many payloads can be put into the master branch.
                             if master_batch.len() >= 10000 {
                                 break;
                             }
                         }
 
-                        // Continue wit the metadata indexing logic.
-                        if let Ok(db_write_trx) = background_worker_db.begin_write() {
-                            // Open the metadata documents table for storing json index.
+                        // Open one write transaction for the entire batch.
+                        if let Ok(write_txn) = background_worker_db.begin_write() {
+                            // Open the metadata and documents table for storing json index.
                             // The metadata table is a multimap table.
-                            if let Ok(mut metdata_indexing_table) =
-                                db_write_trx.open_multimap_table(METADATA_TABLE)
-                            {
-                                // Here, we process json payloads one by one from the vector.
-                                for json_doc in &mut master_batch {
-                                    // We will use simd_json, validate all json before doing a write a commit to the
-                                    // metadata table.
-                                    // the mutable json bytes is a mutable reference which is 100% owwned in this thread.
-                                    // We can modify it here as well if needed.
-                                    match simd_json::to_owned_value(
-                                        &mut json_doc.json_payload_bytes,
-                                    ) {
-                                        // Call the indexing helper funnction to process the payload.
-                                        // The function will return the parsed payload here.
-                                        Ok(parsed_json_payload) => {
-                                            // extract all the key hierarchies from the json
-                                            process_json_index(
-                                                String::new(),
-                                                &parsed_json_payload,
-                                                &json_doc.id,
-                                                &mut metdata_indexing_table,
-                                                true,
-                                            );
+                            if let (Ok(mut documents_table), Ok(mut metadata_indexing_table)) = (
+                                write_txn.open_table(DOCUMENTS_TABLE),
+                                write_txn.open_multimap_table(METADATA_TABLE),
+                            ) {
+                                for op in master_batch.drain(..) {
+                                    match op {
+                                        WriteOp::Insert { id, mut payload } => {
+                                            let _ = documents_table
+                                                .insert(id.as_str(), payload.as_slice());
+                                            if let Ok(parsed_json) =
+                                                simd_json::to_owned_value(&mut payload)
+                                            {
+                                                process_json_index(
+                                                    String::new(),
+                                                    &parsed_json,
+                                                    &id,
+                                                    &mut metadata_indexing_table,
+                                                    true,
+                                                );
+                                            }
                                         }
-                                        // Return error if any error happens.
-                                        Err(e) => {
-                                            println!(
-                                                "Metadata indexing failed for {}: {}",
-                                                &json_doc.id, e
-                                            );
+
+                                        WriteOp::Delete { id } => {
+                                            if let Ok(Some(db_record)) =
+                                                documents_table.remove(id.as_str())
+                                            {
+                                                let mut old_payload = db_record.value().to_vec();
+                                                if let Ok(parsed_json) =
+                                                    simd_json::to_owned_value(&mut old_payload)
+                                                {
+                                                    process_json_index(
+                                                        String::new(),
+                                                        &parsed_json,
+                                                        &id,
+                                                        &mut metadata_indexing_table,
+                                                        false,
+                                                    );
+                                                }
+                                            }
+                                        }
+
+                                        WriteOp::Upsert { id, payload } => {
+                                            // Upsert follows -> remove old metadata indexes, insert into doc, insert into metadata.
+                                            if let Ok(Some(db_record)) =
+                                                documents_table.remove(id.as_str())
+                                            {
+                                                let mut old_payload = db_record.value().to_vec();
+                                                if let Ok(parsed_json) =
+                                                    simd_json::to_owned_value(&mut old_payload)
+                                                {
+                                                    process_json_index(
+                                                        String::new(),
+                                                        &parsed_json,
+                                                        &id,
+                                                        &mut metadata_indexing_table,
+                                                        false,
+                                                    );
+                                                }
+                                            }
+                                            // now insert the records again in both tables.
+                                            let _ = documents_table
+                                                .insert(id.as_str(), payload.as_slice());
+                                            if let Ok(parsed_new_json) =
+                                                simd_json::to_owned_value(&mut payload)
+                                            {
+                                                process_json_index(
+                                                    String::new(),
+                                                    &parsed_new_json,
+                                                    &id,
+                                                    &mut metadata_indexing_table,
+                                                    true,
+                                                );
+                                            }
                                         }
                                     }
                                 }
                             }
 
-                            // commit the changes to the metadata indexing table.
-                            let _ = db_write_trx.commit();
+                            // commit the changes to the tables.
+                            let _ = write_txn.commit();
                         }
                         // clearr the master batch vector for the next batch of payloads.
                         master_batch.clear();
@@ -267,7 +321,7 @@ impl DBEngine {
         // return Self inside Ok()
         Ok(Self {
             db: db_arc,
-            indexing_transmitter: tx,
+            write_txn: tx,
         })
     }
 
@@ -344,42 +398,14 @@ impl DBEngine {
             )));
         }
 
-        // Save the json payload to the documents table.
-        // open a write txn for the documents table.
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        {
-            // Get the documents table.
-            let mut documents_table = write_txn
-                .open_table(DOCUMENTS_TABLE)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            // insert the json payload as bytes to the documents table.
-            documents_table
-                .insert(id, json_payload.as_bytes())
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        }
-        // commit the changes to the database.
-        write_txn
-            .commit()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        // Now, here we trigger the background worker for the metadata processing to store the
-        // keys in the indexing table.
-        // we have to make a copy of the json bytes from Python, for simd_json to validate. it needs
-        // a mutable ref.
-        let index_job = MetadataIndexPayload {
+        let op = WriteOp::Insert {
             id: id.to_string(),
-            json_payload_bytes: json_payload.as_bytes().to_vec(),
+            payload: json_payload.as_bytes().to_vec(),
         };
 
-        // now send the json payload to the background worker.
-        // since the dispatch function now expects a vector of json payloads to process,
-        // we send the json payload wrapped into a Vector.
-        self.dispatch_json_to_worker(vec![index_job])?;
+        self.write_txn
+            .send(op)
+            .map_err(|e| PyRuntimeError::new_err(format!("Write queue full or closed. {}", e)))?;
 
         Ok(())
     }
@@ -579,51 +605,13 @@ impl DBEngine {
     // Delete the record from the documents table.
     // Also, find all the indexes of the record in the metadata indexing
     // table and delete them in one transaction.
-    pub fn delete(&self, id: &str) -> PyResult<bool> {
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    pub fn delete(&self, id: &str) -> PyResult<()> {
+        let op = WriteOp::Delete { id: id.to_string() };
+        self.write_txn
+            .send(op)
+            .map_err(|e| PyRuntimeError::new_err(format!("Write queue full or closed. {}", e)))?;
 
-        let record_existed = {
-            let mut documents_table = write_txn
-                .open_table(DOCUMENTS_TABLE)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            let mut metadata_indexing_table = write_txn
-                .open_multimap_table(METADATA_TABLE)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            let removed_record = documents_table
-                .remove(id)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            // if the document existed, clean up its metadata as well.
-            if let Some(record) = removed_record {
-                // generate the bytes of the deleted document using simd_json.
-                // We need the json bytes to generate the indexes of the document.
-                // to delete them from the metadata indexing table.
-                let mut buffer = record.value().to_vec();
-                if let Ok(parsed_json) = simd_json::to_owned_value(&mut buffer) {
-                    // call the process json index function to delete the indexes.
-                    process_json_index(
-                        String::new(),
-                        &parsed_json,
-                        id,
-                        &mut metadata_indexing_table,
-                        false,
-                    );
-                }
-                true
-            } else {
-                false
-            }
-        };
-        write_txn
-            .commit()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        Ok(record_existed)
+        Ok(())
     }
 
     // Prefix scanning for Document ID.
@@ -678,73 +666,14 @@ impl DBEngine {
     // Function to implement upsert/update functionality.
     // We need to update a record in the documents table, with a get() and then insert().
     // We also need to update the metadata strings of that record in the metadata index table.
-    pub fn upsert<'py>(&self, id: &str, payload: &[u8]) -> PyResult<()> {
-        // make a mutable copy for simd_json to parse.
-        let mut buffer: Vec<u8> = payload.to_vec();
-
-        // validate and parse JSON data at CPU vector speeds.
-        // if json is not valid, raise error to user.
-        let new_parsed_json: OwnedValue = simd_json::to_owned_value(&mut buffer).map_err(|e| {
-            PyRuntimeError::new_err(format!(
-                "Invalid JSON payload for upsert operation, id {}: {}",
-                id, e
-            ))
-        })?;
-
-        // open a write transaction from the DB.
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        {
-            // Open the documents table and the metadata indexing table as well.
-            let mut documents_table = write_txn
-                .open_table(DOCUMENTS_TABLE)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            let mut metadata_indexing_table = write_txn
-                .open_multimap_table(METADATA_TABLE)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            // safely extract the old metadata and drop the guard immediately.
-            let old_data_opt = documents_table
-                .get(id)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                .map(|guard| guard.value().to_vec());
-
-            // check if an existing record is available or not.
-            // if available, we remove all the old records.
-            if let Some(mut old_buffer) = old_data_opt {
-                if let Ok(old_parsed_json) = simd_json::to_owned_value(&mut old_buffer) {
-                    process_json_index(
-                        String::new(),
-                        &old_parsed_json,
-                        id,
-                        &mut metadata_indexing_table,
-                        false,
-                    );
-                }
-            }
-
-            // now insert new payload into the table.
-            documents_table
-                .insert(id, payload)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            // now populate the metadata indexing table with the new parsed json data.
-            process_json_index(
-                String::new(),
-                &new_parsed_json,
-                id,
-                &mut metadata_indexing_table,
-                true,
-            );
-        }
-        // commit the write transaction.
-        write_txn
-            .commit()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    pub fn upsert<'py>(&self, id: &str, json_payload: &[u8]) -> PyResult<()> {
+        let op = WriteOp::Upsert {
+            id: id.to_string(),
+            payload: json_payload.to_vec(),
+        };
+        self.write_txn
+            .send(op)
+            .map_err(|e| PyRuntimeError::new_err(format!("Write queue full or closed. {}", e)))?;
 
         Ok(())
     }
