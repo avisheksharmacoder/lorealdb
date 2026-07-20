@@ -3,7 +3,7 @@ use crossbeam_channel::RecvTimeoutError;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
-use redb::{Database, MultimapTable, MultimapTableDefinition, ReadableTable, TableDefinition};
+use redb::{Database, MultimapTable, MultimapTableDefinition, TableDefinition};
 use simd_json::prelude::*;
 use simd_json::OwnedValue;
 use simd_json::StaticNode;
@@ -32,15 +32,16 @@ fn process_json_index(
 ) {
     // This is a quick inline closure to handle the DB operation.
     // We dont need to write the if/else block in every single data type match arm.
-    let mut update_db = |index_key: String| {
-        if is_insert {
-            // if is_insert is True, insert the keys into the table.
-            let _ = metadata_table.insert(index_key.as_str(), id);
-        } else {
-            // if is_insert is False, remove the keys from the table.
-            let _ = metadata_table.remove(index_key.as_str(), id);
-        }
-    };
+    let update_db =
+        |index_key: String, table: &mut MultimapTable<'_, &'static str, &'static str>| {
+            if is_insert {
+                // if is_insert is True, insert the keys into the table.
+                let _ = table.insert(index_key.as_str(), id);
+            } else {
+                // if is_insert is False, remove the keys from the table.
+                let _ = table.remove(index_key.as_str(), id);
+            }
+        };
 
     // We use match value to find the type of json value in a KV pair,
     // and appropriately process the data type.
@@ -74,27 +75,27 @@ fn process_json_index(
             // update_db takes the data, inserts the data into the multimap table
             // if is_insert = True.
             // Else, it will delete the data, if is_insert = False.
-            update_db(format!("{}.{}", prefix, string_value));
+            update_db(format!("{}.{}", prefix, string_value), metadata_table);
         }
 
         // if the json value is a integer.
         OwnedValue::Static(StaticNode::I64(integer_value)) => {
-            update_db(format!("{}.{}", prefix, integer_value));
+            update_db(format!("{}.{}", prefix, integer_value), metadata_table);
         }
 
         // if the json value is a Float.
         OwnedValue::Static(StaticNode::F64(float_value)) => {
-            update_db(format!("{}.{}", prefix, float_value));
+            update_db(format!("{}.{}", prefix, float_value), metadata_table);
         }
 
         // if the json value is a slice of bytes.
         OwnedValue::Static(StaticNode::U64(bytes_value)) => {
-            update_db(format!("{}.{}", prefix, bytes_value));
+            update_db(format!("{}.{}", prefix, bytes_value), metadata_table);
         }
 
         // if the jsob value is a boolean.
         OwnedValue::Static(StaticNode::Bool(bool_value)) => {
-            update_db(format!("{}.{}", prefix, bool_value));
+            update_db(format!("{}.{}", prefix, bool_value), metadata_table);
         }
         _ => {}
     }
@@ -233,7 +234,7 @@ impl DBEngine {
                                             }
                                         }
 
-                                        WriteOp::Upsert { id, payload } => {
+                                        WriteOp::Upsert { id, mut payload } => {
                                             // Upsert follows -> remove old metadata indexes, insert into doc, insert into metadata.
                                             if let Ok(Some(db_record)) =
                                                 documents_table.remove(id.as_str())
@@ -426,26 +427,22 @@ impl DBEngine {
     // insert method definitions end here. /////////////////////////////////////////////////////////////
 
     pub fn get<'py>(&self, py: Python<'py>, id: &str) -> PyResult<Option<Bound<'py, PyBytes>>> {
-        let db_result: Result<Option<Vec<u8>>, PyRuntimeError> = py.allow_threads(|| {
-            let read_txn = self
-                .db
-                .begin_read()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let db_result: Result<Option<Vec<u8>>, String> = py.detach(|| {
+            let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
             let documents_table = read_txn
                 .open_table(DOCUMENTS_TABLE)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(|e| e.to_string())?;
 
-            if let Some(access_guard) = documents_table
-                .get(id)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-            {
+            if let Ok(Some(access_guard)) = documents_table.get(id).map_err(|e| e.to_string()) {
                 Ok(Some(access_guard.value().to_vec()))
             } else {
                 Ok(None)
             }
         });
-        match db_result? {
-            Some(bytes) => Ok(Some(PyBytes::new(py, &bytes))),
+        // Once we have the GIL back, we convert the string error to PyRuntimeError via ?.
+        let bytes_option = db_result.map_err(|e| PyRuntimeError::new_err(e))?;
+        match bytes_option {
+            Some(bytes) => Ok(Some(PyBytes::new(py, bytes.as_slice()))),
             None => Ok(None),
         }
     }
@@ -457,42 +454,38 @@ impl DBEngine {
         py: Python<'py>,
         ids: Vec<String>,
     ) -> PyResult<HashMap<String, Option<Bound<'py, PyBytes>>>> {
-        let db_result: Result<HashMap<String, Option<Vec<u8>>>, PyRuntimeError> =
-            py.allow_threads(|| {
-                // create a read transaction.
-                let read_txn = self
-                    .db
-                    .begin_read()
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let db_result: Result<HashMap<String, Option<Vec<u8>>>, String> = py.detach(|| {
+            // create a read transaction.
+            let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
 
-                //  Fetch the data of the Documents table.
-                let documents_table = read_txn
-                    .open_table(DOCUMENTS_TABLE)
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            //  Fetch the data of the Documents table.
+            let documents_table = read_txn
+                .open_table(DOCUMENTS_TABLE)
+                .map_err(|e| e.to_string())?;
 
-                // Preallocate the hashmap data capacity to prevent reallocation overhead.
-                let mut document_results = HashMap::with_capacity(ids.len());
+            // Preallocate the hashmap data capacity to prevent reallocation overhead.
+            let mut document_results = HashMap::with_capacity(ids.len());
 
-                // populate the hashmap with the result items.
-                for id in ids {
-                    if let Some(access_guard) = documents_table
-                        .get(id.as_str())
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                    {
-                        // add the id and access_guard value, if found from the table.
-                        document_results.insert(id, Some(access_guard.value().to_vec()));
-                    } else {
-                        // add the id and None.
-                        document_results.insert(id, None);
-                    }
+            // populate the hashmap with the result items.
+            for id in ids {
+                if let Some(access_guard) = documents_table
+                    .get(id.as_str())
+                    .map_err(|e| e.to_string())?
+                {
+                    // add the id and access_guard value, if found from the table.
+                    document_results.insert(id, Some(access_guard.value().to_vec()));
+                } else {
+                    // add the id and None.
+                    document_results.insert(id, None);
                 }
+            }
 
-                Ok(document_results)
-            });
+            Ok(document_results)
+        });
 
         // reacquire the GIL and send back the Python objects.
         let mut final_results = HashMap::new();
-        for (id, result_value) in db_result? {
+        for (id, result_value) in db_result.map_err(|e| PyRuntimeError::new_err(e))? {
             match result_value {
                 Some(bytes) => final_results.insert(id, Some(PyBytes::new(py, &bytes))),
                 None => final_results.insert(id, None),
@@ -521,30 +514,24 @@ impl DBEngine {
         py: Python<'py>,
         prefix: &str,
     ) -> PyResult<Vec<(String, Bound<'py, PyBytes>)>> {
-        let db_result: Result<Vec<(String, Vec<u8>)>, PyRuntimeError> = py.allow_threads(|| {
+        let db_result: Result<Vec<(String, Vec<u8>)>, String> = py.detach(|| {
             // Create a read transaction from the DB Engine.
-            let read_txn = self
-                .db
-                .begin_read()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
 
             // Get the Documents table.
             let documents_table = read_txn
                 .open_table(DOCUMENTS_TABLE)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(|e| e.to_string())?;
 
             // create a hashmap to return the results into.
             let mut results = Vec::new();
 
             // create an iterator starting from the prefix to the end of the db
             // use range to create the iterator.
-            let table_iterator = documents_table
-                .range(prefix..)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let table_iterator = documents_table.range(prefix..).map_err(|e| e.to_string())?;
 
             for item in table_iterator {
-                let (key_guard, value_guard) =
-                    item.map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let (key_guard, value_guard) = item.map_err(|e| e.to_string())?;
                 let current_key = key_guard.value();
                 // we can break out if the CPU prefix no longer matches.
                 if !current_key.starts_with(prefix) {
@@ -555,9 +542,10 @@ impl DBEngine {
             Ok(results)
         });
         // Reacquire GIL and map to pybytes.
-        let final_results = db_result?
+        let final_results = db_result
+            .map_err(|e| PyRuntimeError::new_err(e))?
             .into_iter()
-            .map(|(k, v)| (k, PyBytes::new(py, &v)))
+            .map(|(k, v)| (k, PyBytes::new(py, v.as_slice())))
             .collect();
 
         Ok(final_results)
@@ -588,22 +576,19 @@ impl DBEngine {
         // format the search term into key:value format.
         let search_term_formatted = format!("{}.{}", index_key, index_value);
 
-        let db_result: Result<Vec<(String, Vec<u8>)>, PyRuntimeError> = py.allow_threads(|| {
-            let read_txn = self
-                .db
-                .begin_read()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let db_result: Result<Vec<(String, Vec<u8>)>, String> = py.detach(|| {
+            let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
 
             // open the documents table.
             let documents_table = read_txn
                 .open_table(DOCUMENTS_TABLE)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(|e| e.to_string())?;
 
             // open the metadata index table for storing the fetched key and value pairs
             // from Python.
             let metadata_index_table = read_txn
                 .open_multimap_table(METADATA_TABLE)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(|e| e.to_string())?;
 
             // create the results hashmap to send to Python after data processing.
             let mut results = Vec::new();
@@ -613,22 +598,20 @@ impl DBEngine {
             // Optimized DB Engine.
             let matching_id_iterator = metadata_index_table
                 .get(search_term_formatted.as_str())
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(|e| e.to_string())?;
 
             for document_id in matching_id_iterator {
-                let id_guard = document_id.map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let id_guard = document_id.map_err(|e| e.to_string())?;
                 let doc_id = id_guard.value();
 
-                if let Some(doc_guard) = documents_table
-                    .get(doc_id)
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                {
+                if let Some(doc_guard) = documents_table.get(doc_id).map_err(|e| e.to_string())? {
                     results.push((doc_id.to_string(), doc_guard.value().to_vec()));
                 }
             }
             Ok(results)
         });
-        let fiinal_results = db_result?
+        let fiinal_results = db_result
+            .map_err(|e| PyRuntimeError::new_err(e))?
             .into_iter()
             .map(|(k, v)| (k, PyBytes::new(py, &v)))
             .collect();
