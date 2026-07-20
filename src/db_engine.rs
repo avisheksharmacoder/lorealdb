@@ -457,35 +457,48 @@ impl DBEngine {
         py: Python<'py>,
         ids: Vec<String>,
     ) -> PyResult<HashMap<String, Option<Bound<'py, PyBytes>>>> {
-        // create a read transaction.
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let db_result: Result<HashMap<String, Option<Vec<u8>>>, PyRuntimeError> =
+            py.allow_threads(|| {
+                // create a read transaction.
+                let read_txn = self
+                    .db
+                    .begin_read()
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        //  Fetch the data of the Documents table.
-        let documents_table = read_txn
-            .open_table(DOCUMENTS_TABLE)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                //  Fetch the data of the Documents table.
+                let documents_table = read_txn
+                    .open_table(DOCUMENTS_TABLE)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        // Preallocate the hashmap data capacity to prevent reallocation overhead.
-        let mut document_results = HashMap::with_capacity(ids.len());
+                // Preallocate the hashmap data capacity to prevent reallocation overhead.
+                let mut document_results = HashMap::with_capacity(ids.len());
 
-        // populate the hashmap with the result items.
-        for id in ids {
-            if let Some(access_guard) = documents_table
-                .get(id.as_str())
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-            {
-                // add the id and access_guard value, if found from the table.
-                document_results.insert(id, Some(PyBytes::new(py, access_guard.value())));
-            } else {
-                // add the id and None.
-                document_results.insert(id, None);
-            }
+                // populate the hashmap with the result items.
+                for id in ids {
+                    if let Some(access_guard) = documents_table
+                        .get(id.as_str())
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                    {
+                        // add the id and access_guard value, if found from the table.
+                        document_results.insert(id, Some(access_guard.value().to_vec()));
+                    } else {
+                        // add the id and None.
+                        document_results.insert(id, None);
+                    }
+                }
+
+                Ok(document_results)
+            });
+
+        // reacquire the GIL and send back the Python objects.
+        let mut final_results = HashMap::new();
+        for (id, result_value) in db_result? {
+            match result_value {
+                Some(bytes) => final_results.insert(id, Some(PyBytes::new(py, &bytes))),
+                None => final_results.insert(id, None),
+            };
         }
-
-        Ok(document_results)
+        Ok(final_results)
     }
 
     // Delete the record from the documents table.
@@ -508,45 +521,46 @@ impl DBEngine {
         py: Python<'py>,
         prefix: &str,
     ) -> PyResult<Vec<(String, Bound<'py, PyBytes>)>> {
-        // Create a read transaction from the DB Engine.
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let db_result: Result<Vec<(String, Vec<u8>)>, PyRuntimeError> = py.allow_threads(|| {
+            // Create a read transaction from the DB Engine.
+            let read_txn = self
+                .db
+                .begin_read()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        // Get the Documents table.
-        let documents_table = read_txn
-            .open_table(DOCUMENTS_TABLE)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            // Get the Documents table.
+            let documents_table = read_txn
+                .open_table(DOCUMENTS_TABLE)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        // create a hashmap to return the results into.
-        let mut results = Vec::new();
+            // create a hashmap to return the results into.
+            let mut results = Vec::new();
 
-        // create an iterator starting from the prefix to the end of the db
-        // use range to create the iterator.
-        let table_iterator = documents_table
-            .range(prefix..)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            // create an iterator starting from the prefix to the end of the db
+            // use range to create the iterator.
+            let table_iterator = documents_table
+                .range(prefix..)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        for item in table_iterator {
-            let (key_guard, value_guard) =
-                item.map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            let current_key = key_guard.value();
-
-            // in redb, keyguards are sorted alphabetically.
-            // if we do not find a key, that means there are no keys that match the prefix.
-            // So from here, we break out to save CPU.
-            if !current_key.starts_with(prefix) {
-                break;
+            for item in table_iterator {
+                let (key_guard, value_guard) =
+                    item.map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let current_key = key_guard.value();
+                // we can break out if the CPU prefix no longer matches.
+                if !current_key.starts_with(prefix) {
+                    break;
+                }
+                results.push((current_key.to_string(), value_guard.value().to_vec()));
             }
+            Ok(results)
+        });
+        // Reacquire GIL and map to pybytes.
+        let final_results = db_result?
+            .into_iter()
+            .map(|(k, v)| (k, PyBytes::new(py, &v)))
+            .collect();
 
-            // if we find keys, insert it into the hashmap, the id and the bytes.
-            results.push((
-                current_key.to_string(),
-                PyBytes::new(py, value_guard.value()),
-            ));
-        }
-        Ok(results)
+        Ok(final_results)
     }
 
     // Function to implement upsert/update functionality.
@@ -571,50 +585,53 @@ impl DBEngine {
         index_key: &str,
         index_value: &str,
     ) -> PyResult<Vec<(String, Bound<'py, PyBytes>)>> {
-        // create a read transaction.
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        // open the documents table.
-        let documents_table = read_txn
-            .open_table(DOCUMENTS_TABLE)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        // open the metadata index table for storing the fetched key and value pairs
-        // from Python.
-        let metadata_index_table = read_txn
-            .open_multimap_table(METADATA_TABLE)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
         // format the search term into key:value format.
         let search_term_formatted = format!("{}.{}", index_key, index_value);
 
-        // create the results hashmap to send to Python after data processing.
-        let mut results = Vec::new();
+        let db_result: Result<Vec<(String, Vec<u8>)>, PyRuntimeError> = py.allow_threads(|| {
+            let read_txn = self
+                .db
+                .begin_read()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        // fetch all the matching document IDs from the index table, which needs to be implemented at
-        // insert time for the documents table. This introduces a write time slowness but this is a Read
-        // Optimized DB Engine.
-        let matching_id_iterator = metadata_index_table
-            .get(search_term_formatted.as_str())
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            // open the documents table.
+            let documents_table = read_txn
+                .open_table(DOCUMENTS_TABLE)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        // fetch records that we actually need to send to Python, from the documents table
-        // using the iterator created from the metadata index table.
-        for document_id in matching_id_iterator {
-            let id_guard = document_id.map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            let doc_id = id_guard.value();
+            // open the metadata index table for storing the fetched key and value pairs
+            // from Python.
+            let metadata_index_table = read_txn
+                .open_multimap_table(METADATA_TABLE)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-            // now fetch the document from the documents table using the guard pattern.
-            if let Some(doc_guard) = documents_table
-                .get(doc_id)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-            {
-                results.push((doc_id.to_string(), PyBytes::new(py, doc_guard.value())));
+            // create the results hashmap to send to Python after data processing.
+            let mut results = Vec::new();
+
+            // fetch all the matching document IDs from the index table, which needs to be implemented at
+            // insert time for the documents table. This introduces a write time slowness but this is a Read
+            // Optimized DB Engine.
+            let matching_id_iterator = metadata_index_table
+                .get(search_term_formatted.as_str())
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+            for document_id in matching_id_iterator {
+                let id_guard = document_id.map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let doc_id = id_guard.value();
+
+                if let Some(doc_guard) = documents_table
+                    .get(doc_id)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                {
+                    results.push((doc_id.to_string(), doc_guard.value().to_vec()));
+                }
             }
-        }
-        Ok(results)
+            Ok(results)
+        });
+        let fiinal_results = db_result?
+            .into_iter()
+            .map(|(k, v)| (k, PyBytes::new(py, &v)))
+            .collect();
+        Ok(fiinal_results)
     }
 }
