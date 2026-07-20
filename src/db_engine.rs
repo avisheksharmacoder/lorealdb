@@ -49,7 +49,7 @@ fn process_json_index(
         // if the value of the json doc is a json.
         OwnedValue::Object(obj) => {
             for (json_key, json_value) in obj.iter() {
-                let new_prefix = if json_key.is_empty() {
+                let new_prefix = if prefix.is_empty() {
                     json_key.to_string()
                 } else {
                     // If json = {"a": "b"}, then prefix key = "a.b"
@@ -64,7 +64,11 @@ fn process_json_index(
         // if the json value is an array, we need loop again.
         OwnedValue::Array(arr) => {
             for (element_index, element_value) in arr.iter().enumerate() {
-                let new_prefix = format!("{}.{}", prefix, element_index);
+                let new_prefix = if prefix.is_empty() {
+                    element_index.to_string()
+                } else {
+                    format!("{}.{}", prefix, element_index)
+                };
                 // recursively process the json in the array.
                 process_json_index(new_prefix, element_value, id, metadata_table, is_insert);
             }
