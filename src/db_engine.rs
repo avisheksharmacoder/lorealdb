@@ -558,10 +558,23 @@ impl DBEngine {
     // Function to implement upsert/update functionality.
     // We need to update a record in the documents table, with a get() and then insert().
     // We also need to update the metadata strings of that record in the metadata index table.
-    pub fn upsert<'py>(&self, id: &str, json_payload: &[u8]) -> PyResult<()> {
+    pub fn upsert<'py>(&self, id: &str, json_payload: Bound<'py, PyDict>) -> PyResult<()> {
+        // Serialize the PyDict payload from Python to a rust serde_json Value.
+        let dict_rust_value: Value = depythonize(&json_payload).map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "Error converting dict to Rust bytes for {}.{}",
+                id, e
+            ))
+        })?;
+
+        // Convert the serde_json value to a rust bytes vector.
+        let buffer = serde_json::to_vec(&dict_rust_value).map_err(|e| {
+            PyRuntimeError::new_err(format!("Failed to encode bytes for {}.{}", id, e))
+        })?;
+
         let op = WriteOp::Upsert {
             id: id.to_string(),
-            payload: json_payload.to_vec(),
+            payload: buffer,
         };
         self.write_txn
             .send(op)
