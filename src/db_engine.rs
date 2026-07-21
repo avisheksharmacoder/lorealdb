@@ -305,10 +305,10 @@ impl DBEngine {
         &self,
         _py: Python<'py>,
         id: &str,
-        dict_payload: Bound<'py, PyDict>,
+        payload: Bound<'py, PyDict>,
     ) -> PyResult<()> {
         // Serialize the PyDict payload from Python to rust bytes.
-        let dict_rust_value: Value = depythonize(&dict_payload).map_err(|e| {
+        let dict_rust_value: Value = depythonize(&payload).map_err(|e| {
             PyRuntimeError::new_err(format!(
                 "Error converting dict to Rust bytes for {}.{}",
                 id, e
