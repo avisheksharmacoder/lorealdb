@@ -1,8 +1,9 @@
-import time
 import json
 import os
+import time
 from typing import List, Tuple
-from lorealdb import DBEngineWriteOptimized
+
+from lorealdb import DBEngine
 
 # --- CONFIGURATION ---
 DB_PATH = "benchmark_test.redb"
@@ -33,12 +34,11 @@ print(
     f"🔄 Will cycle these records to run {BATCH_LOOPS:,} batch loops of {RECORDS_PER_BATCH:,} to reach {TARGET_BATCH_RECORDS:,} records."
 )
 
-# PRE-ENCODE: We encode to bytes now so Python's JSON parser doesn't slow down the Rust benchmark
-encoded_source_data = [json.dumps(record).encode("utf-8") for record in source_data]
-single_test_payload = encoded_source_data[0]
+# We leave the data as standard Python dictionaries, as depythonize will handle serialization inside Rust
+single_test_payload = source_data[0]
 
-print(f"\n🚀 Initializing DBEngineWriteOptimized at {DB_PATH}...")
-db = DBEngineWriteOptimized(DB_PATH)
+print(f"\n🚀 Initializing DBEngine at {DB_PATH}...")
+db = DBEngine(DB_PATH)
 
 
 print("\n" + "=" * 50)
@@ -47,8 +47,8 @@ print("=" * 50)
 start_time = time.perf_counter()
 
 for i in range(SINGLE_INSERTS):
-    # Just reuse the first payload for the single insert tests
-    db.insert_raw(f"single_{i}", single_test_payload)
+    # db.insert_raw is replaced by db.insert which accepts a dictionary
+    db.insert(f"single_{i}", single_test_payload)
 
 end_time = time.perf_counter()
 duration = end_time - start_time
@@ -63,12 +63,13 @@ print("=" * 50)
 start_time = time.perf_counter()
 
 for loop_idx in range(BATCH_LOOPS):
-    # Zip our generated unique IDs with the cycled payloads using modulo arithmetic
-    batch: List[Tuple[str, bytes]] = [
-        (f"batch_{loop_idx}_{i}", encoded_source_data[i % num_source_records])
+    # Type hinting updated to dict
+    batch: List[Tuple[str, dict]] = [
+        (f"batch_{loop_idx}_{i}", source_data[i % num_source_records])
         for i in range(RECORDS_PER_BATCH)
     ]
-    db.insert_many_raw(batch)
+    # insert_many_raw is replaced by insert_many
+    db.insert_many(batch)
 
     # Print progress every 100 loops (100k records)
     if loop_idx > 0 and loop_idx % 100 == 0:
@@ -140,4 +141,40 @@ print(f"✅ Deleted 5,000 records.")
 print(f"⏱️  Time: {duration:.4f} seconds")
 print(f"⚡ Speed: {5000 / duration:,.0f} deletes/second")
 
-print("\n🎉 1 MILLION RECORD BENCHMARK COMPLETE!")
+
+print("\n" + "=" * 50)
+print(f" 7. TESTING UPSERTS (5,000 records)")
+print("=" * 50)
+start_time = time.perf_counter()
+
+# We take the remaining half of the single inserts and update them with a new key
+upsert_payload = single_test_payload.copy()
+upsert_payload["benchmark_status"] = "upserted"
+
+for i in range(5000, 10000):
+    db.upsert(f"single_{i}", upsert_payload)
+
+end_time = time.perf_counter()
+duration = end_time - start_time
+print(f"✅ Upserted 5,000 records.")
+print(f"⏱️  Time: {duration:.4f} seconds")
+print(f"⚡ Speed: {5000 / duration:,.0f} upserts/second")
+
+print("\n" + "=" * 50)
+print(f" 8. TESTING METADATA FILTERING")
+print("=" * 50)
+
+# ⏳ Delay to allow the Rust background worker to drain the channel,
+# parse the JSON, and commit the metadata indexes to disk.
+print("⏳ Waiting for background indexing thread to commit... (3 seconds)")
+time.sleep(3)
+
+start_time = time.perf_counter()
+
+# Filtering by the exact key-value pair we just injected during the upsert phase
+filtered_results = db.filter_by_metadata("benchmark_status", "upserted")
+
+end_time = time.perf_counter()
+duration = end_time - start_time
+print(f"✅ Filter returned {len(filtered_results):,} records.")
+print(f"⏱️  Time: {duration:.6f} seconds")
