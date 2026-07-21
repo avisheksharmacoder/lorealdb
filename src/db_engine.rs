@@ -517,7 +517,7 @@ impl DBEngine {
         &self,
         py: Python<'py>,
         prefix: &str,
-    ) -> PyResult<Vec<(String, Bound<'py, PyBytes>)>> {
+    ) -> PyResult<Vec<(String, Bound<'py, PyDict>)>> {
         let db_result: Result<Vec<(String, Vec<u8>)>, String> = py.detach(|| {
             // Create a read transaction from the DB Engine.
             let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
@@ -549,8 +549,20 @@ impl DBEngine {
         let final_results = db_result
             .map_err(|e| PyRuntimeError::new_err(e))?
             .into_iter()
-            .map(|(k, v)| (k, PyBytes::new(py, v.as_slice())))
-            .collect();
+            .map(|(k, v)| {
+                // Deserialzie the bytes to json
+                let json_value: Value = serde_json::from_slice(&v)
+                    .map_err(|e| PyRuntimeError::new_err(format!("Json Parse Error {}", e)))?;
+                // convert to py Any type.
+                let py_any = pythonize::pythonize(py, &json_value)
+                    .map_err(|e| PyRuntimeError::new_err(format!("Pythonize Error {}", e)))?;
+                // convert to a dict.
+                let py_dict = py_any.cast_into::<PyDict>().map_err(|_| {
+                    PyRuntimeError::new_err("Database entry is not a valid JSON/Dictionary")
+                })?;
+                Ok((k, py_dict))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
 
         Ok(final_results)
     }
