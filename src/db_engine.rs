@@ -430,7 +430,7 @@ impl DBEngine {
 
     // insert method definitions end here. /////////////////////////////////////////////////////////////
 
-    pub fn get<'py>(&self, py: Python<'py>, id: &str) -> PyResult<Option<Bound<'py, PyBytes>>> {
+    pub fn get<'py>(&self, py: Python<'py>, id: &str) -> PyResult<Option<Bound<'py, PyDict>>> {
         let db_result: Result<Option<Vec<u8>>, String> = py.detach(|| {
             let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
             let documents_table = read_txn
@@ -446,7 +446,20 @@ impl DBEngine {
         // Once we have the GIL back, we convert the string error to PyRuntimeError via ?.
         let bytes_option = db_result.map_err(|e| PyRuntimeError::new_err(e))?;
         match bytes_option {
-            Some(bytes) => Ok(Some(PyBytes::new(py, bytes.as_slice()))),
+            Some(bytes) => {
+                // serialize to json
+                let json_value: Value = serde_json::from_slice(&bytes)
+                    .map_err(|e| PyRuntimeError::new_err(format!("Json parsing error {}", e)))?;
+                // convert to py any type.
+                let py_any = pythonize::pythonize(py, &json_value).map_err(|e| {
+                    PyRuntimeError::new_err(format!("Error while pythonizing {}", e))
+                })?;
+                // convert to dict.
+                let py_dict = py_any.cast_into::<PyDict>().map_err(|_| {
+                    PyRuntimeError::new_err("Database entry is not a valid JSON/Dictionary")
+                })?;
+                Ok(Some(py_dict))
+            }
             None => Ok(None),
         }
     }
@@ -458,7 +471,7 @@ impl DBEngine {
         py: Python<'py>,
         ids: Vec<String>,
     ) -> PyResult<Vec<(String, Option<Bound<'py, PyDict>>)>> {
-        let db_results: Result<HashMap<String, Option<Vec<u8>>>, String> = py.detach(|| {
+        let db_results: Result<Vec<(String, Option<Vec<u8>>)>, String> = py.detach(|| {
             // create a read transaction.
             let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
 
@@ -468,7 +481,7 @@ impl DBEngine {
                 .map_err(|e| e.to_string())?;
 
             // Preallocate the hashmap data capacity to prevent reallocation overhead.
-            let mut document_results = HashMap::with_capacity(ids.len());
+            let mut document_results = Vec::with_capacity(ids.len());
 
             // populate the hashmap with the result items.
             for id in ids {
@@ -477,10 +490,10 @@ impl DBEngine {
                     .map_err(|e| e.to_string())?
                 {
                     // add the id and access_guard value, if found from the table.
-                    document_results.insert(id, Some(access_guard.value().to_vec()));
+                    document_results.push((id, Some(access_guard.value().to_vec())));
                 } else {
                     // add the id and None.
-                    document_results.insert(id, None);
+                    document_results.push((id, None));
                 }
             }
 
