@@ -457,8 +457,8 @@ impl DBEngine {
         &self,
         py: Python<'py>,
         ids: Vec<String>,
-    ) -> PyResult<HashMap<String, Option<Bound<'py, PyBytes>>>> {
-        let db_result: Result<HashMap<String, Option<Vec<u8>>>, String> = py.detach(|| {
+    ) -> PyResult<Vec<(String, Option<Bound<'py, PyDict>>)>> {
+        let db_results: Result<HashMap<String, Option<Vec<u8>>>, String> = py.detach(|| {
             // create a read transaction.
             let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
 
@@ -488,13 +488,31 @@ impl DBEngine {
         });
 
         // reacquire the GIL and send back the Python objects.
-        let mut final_results = HashMap::new();
-        for (id, result_value) in db_result.map_err(|e| PyRuntimeError::new_err(e))? {
-            match result_value {
-                Some(bytes) => final_results.insert(id, Some(PyBytes::new(py, &bytes))),
-                None => final_results.insert(id, None),
-            };
-        }
+        let final_results = db_results
+            .map_err(|e| PyRuntimeError::new_err(e))?
+            .into_iter()
+            .map(|(id, result_value)| {
+                match result_value {
+                    Some(bytes) => {
+                        // serialize to json
+                        let json_value: Value = serde_json::from_slice(&bytes).map_err(|e| {
+                            PyRuntimeError::new_err(format!("Json parsing error {}", e))
+                        })?;
+                        // convert to py any type.
+                        let py_any = pythonize::pythonize(py, &json_value).map_err(|e| {
+                            PyRuntimeError::new_err(format!("Error while pythonizing {}", e))
+                        })?;
+                        // convert to dict.
+                        let py_dict = py_any.cast_into::<PyDict>().map_err(|_| {
+                            PyRuntimeError::new_err("Database entry is not a valid JSON/Dictionary")
+                        })?;
+                        Ok((id, Some(py_dict)))
+                    }
+                    None => Ok((id, None)),
+                }
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+
         Ok(final_results)
     }
 
