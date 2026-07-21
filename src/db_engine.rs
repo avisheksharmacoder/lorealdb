@@ -558,9 +558,9 @@ impl DBEngine {
     // Function to implement upsert/update functionality.
     // We need to update a record in the documents table, with a get() and then insert().
     // We also need to update the metadata strings of that record in the metadata index table.
-    pub fn upsert<'py>(&self, id: &str, json_payload: Bound<'py, PyDict>) -> PyResult<()> {
+    pub fn upsert<'py>(&self, id: &str, payload: Bound<'py, PyDict>) -> PyResult<()> {
         // Serialize the PyDict payload from Python to a rust serde_json Value.
-        let dict_rust_value: Value = depythonize(&json_payload).map_err(|e| {
+        let dict_rust_value: Value = depythonize(&payload).map_err(|e| {
             PyRuntimeError::new_err(format!(
                 "Error converting dict to Rust bytes for {}.{}",
                 id, e
@@ -589,7 +589,7 @@ impl DBEngine {
         py: Python<'py>,
         index_key: &str,
         index_value: &str,
-    ) -> PyResult<Vec<(String, Bound<'py, PyBytes>)>> {
+    ) -> PyResult<Vec<(String, Bound<'py, PyDict>)>> {
         // format the search term into key:value format.
         let search_term_formatted = format!("{}.{}", index_key, index_value);
 
@@ -630,8 +630,20 @@ impl DBEngine {
         let fiinal_results = db_result
             .map_err(|e| PyRuntimeError::new_err(e))?
             .into_iter()
-            .map(|(k, v)| (k, PyBytes::new(py, &v)))
-            .collect();
+            .map(|(k, v)| {
+                // Deserialzie the bytes to json
+                let json_value: Value = serde_json::from_slice(&v)
+                    .map_err(|e| PyRuntimeError::new_err(format!("Json Parse Error {}", e)))?;
+                // convert to py Any type.
+                let py_any = pythonize::pythonize(py, &json_value)
+                    .map_err(|e| PyRuntimeError::new_err(format!("Pythonize Error {}", e)))?;
+                // convert to a dict.
+                let py_dict = py_any.cast_into::<PyDict>().map_err(|_| {
+                    PyRuntimeError::new_err("Database entry is not a valid JSON/Dictionary")
+                })?;
+                Ok((k, py_dict))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
         Ok(fiinal_results)
     }
 }
