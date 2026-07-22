@@ -6,7 +6,7 @@
 
 **Lorealdb is created to end your data storage headache with just one single, simple, highly optimized, and highly rustified tool.**
 
-## ✨ Features
+## ✨ Features (DBEngine)
 
 - **Dead Simple:** No configuration, no servers, no ports. Just point it to a file path and start saving data.
 - **Blazing Fast I/O:** Built natively in 100% Rust for zero-cost abstraction.
@@ -33,6 +33,16 @@ _Or if you prefer using `uv`:_
 ---
 
 > **Note:** `DBEngine` is read-optimized. It natively accepts standard Python dictionaries, transparently converting them to raw bytes to automatically build a high-speed metadata index in the background.
+
+### Available Engines
+
+1. **DBEngine:** A fast embedded JSON database with SIMD powered JSON/Dict validations.
+
+### Upcoming engines (in development)
+
+1. **DBEngineWebServer:** A document database for Python web frameworks.
+2. **DBEngineVectorStore:** A document database + vector store for RAG and AI workloads.
+3. **DBEngineWriteOptimized:** A document database storing AI conversations at scale.
 
 ## Full API Reference for [DBEngine](docs/DBEngine.md)
 
