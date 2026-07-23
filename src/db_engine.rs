@@ -2,18 +2,18 @@ use crossbeam_channel::bounded;
 use crossbeam_channel::RecvTimeoutError;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict};
+use pyo3::types::PyDict;
 use redb::{Database, MultimapTable, MultimapTableDefinition, TableDefinition};
 use simd_json::prelude::*;
 use simd_json::OwnedValue;
 use simd_json::StaticNode;
-use std::collections::HashMap;
 
 use pythonize::depythonize;
 use serde_json::Value;
 
 // import crossbeam-channel's Unbonded and Sender.
 use crossbeam_channel::Sender;
+use std::net::Shutdown::Write;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -115,10 +115,12 @@ const METADATA_TABLE: MultimapTableDefinition<&str, &str> =
 
 // We define the WriteOp Enum.
 // This is the universal instruction set from Python to the Master Writer.
+// The Shutdown operation to drain the queue before Python shuts down the process.
 enum WriteOp {
     Insert { id: String, payload: Vec<u8> },
     Delete { id: String },
     Upsert { id: String, payload: Vec<u8> },
+    ShutDown,
 }
 
 // create the Database engine.
@@ -131,6 +133,8 @@ enum WriteOp {
 pub struct DBEngine {
     db: Arc<Database>,
     write_txn: Sender<WriteOp>,
+    // We add a handle for python to refer to before closing down.
+    worker_handle: Option<thread::JoinHandle<()>>,
 }
 
 #[pymethods]
@@ -170,7 +174,7 @@ impl DBEngine {
 
         // spawn the background worker thread, for processing the metadata of the json separately.
         // We implement a master write, to handle the disk operations in 3 types.
-        thread::spawn(move || {
+        let worker_handle = thread::spawn(move || {
             // create the batch time of 10ms.
             let queue_batch_time = Duration::from_millis(10);
 
@@ -195,6 +199,8 @@ impl DBEngine {
 
                         // Open one write transaction for the entire batch.
                         if let Ok(write_txn) = background_worker_db.begin_write() {
+                            // add a shutdown flag.
+                            let mut shutdown_signal = false;
                             // Open the metadata and documents table for storing json index.
                             // The metadata table is a multimap table.
                             if let (Ok(mut documents_table), Ok(mut metadata_indexing_table)) = (
@@ -271,12 +277,21 @@ impl DBEngine {
                                                 );
                                             }
                                         }
+
+                                        WriteOp::ShutDown => {
+                                            shutdown_signal = true;
+                                        }
                                     }
                                 }
                             }
 
                             // commit the changes to the tables.
                             let _ = write_txn.commit();
+
+                            // shutdown here.,
+                            if shutdown_signal {
+                                break;
+                            }
                         }
                         // clearr the master batch vector for the next batch of payloads.
                         master_batch.clear();
@@ -295,7 +310,26 @@ impl DBEngine {
         Ok(Self {
             db: db_arc,
             write_txn: tx,
+            worker_handle: Some(worker_handle),
         })
+    }
+
+    // expose a close function call to python to confirm that all database
+    // operations are completed, before the python process is killed.
+    pub fn close_engine(&mut self) -> PyResult<()> {
+        // send the shutdown
+        self.write_txn.send(WriteOp::ShutDown).map_err(|e| {
+            PyRuntimeError::new_err(format!("Failed to send shutdown signal {}", e))
+        })?;
+
+        // take the thread handle, wait for it to finish committing to redb.
+        if let Some(handle) = self.worker_handle.take() {
+            handle.join().map_err(|_| {
+                PyRuntimeError::new_err("Background writer panicked during shut down {}")
+            })?;
+        }
+
+        Ok(())
     }
 
     // Insert a new record into the Documents Table.
