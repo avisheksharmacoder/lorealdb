@@ -273,3 +273,25 @@ for doc_id, data in admins:
     print(f"Found admin {doc_id}: {data}")
 
 ```
+
+---
+
+## Lifecycle Management
+
+### `close_engine()`
+
+Gracefully shuts down the database engine. This method sends a shutdown signal to the background worker and waits for it to finish draining the queue and committing any pending write operations to the disk.
+
+You **must** call this method before your Python application exits to ensure no data is lost during the final ~10ms window.
+
+- **Arguments:** None.
+- **Returns:** `None` (Raises a `RuntimeError` if the shutdown signal fails to send or the background thread panics).
+
+```python
+# Perform your database operations
+engine.insert("doc_99", {"status": "finalizing"})
+
+# Ensure all background writes are safely committed to disk before exiting
+engine.close_engine()
+
+```
