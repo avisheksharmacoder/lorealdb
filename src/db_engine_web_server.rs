@@ -785,4 +785,10 @@ impl DBEngineWebServer {
             .collect::<PyResult<Vec<_>>>()?;
         Ok(fiinal_results)
     }
+
+    #[getter]
+    // returns the no of pending operations sitting in the queue currently.
+    pub fn queue_size(&self) -> usize {
+        self.write_txn.len()
+    }
 }
