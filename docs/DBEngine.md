@@ -5,6 +5,70 @@ The `DBEngine` is a high-performance, read-optimized database engine built in Ru
 > **Note on Data Types:**
 > The engine handles serialization and deserialization entirely in Rust. You can pass native Python dictionaries (or raw JSON strings using specific methods) directly to the API. When reading data, the engine automatically returns native Python dictionaries.
 
+# Architecture of `DBEngine`
+
+The `DBEngine` class is highly optimized out of the box. For embedded use cases, this is the only engine you will ever need. We stripped away all the complex configurations, technical nuances, and hectic installation processes typical of other Rust-native document databases.
+
+_Fun fact:_ Lorealdb is Python-native first. The database engine is designed to abstract almost every technical hurdle you hate dealing with when writing applications.
+
+## How data storage happens under the hood
+
+To keep your Python application running at maximum speed, `DBEngine` separates the work you do from the work the disk does:
+
+1. **Serialization:** You send a Python dictionary or a JSON string to `DBEngine`.
+2. **Fast Validation:** It converts the payload to bytes and validates it at extreme speeds using `simdjson`.
+3. **Non-blocking Handoff:** It immediately pushes the payload to a thread-safe background queue and gives control back to your Python app. **(Your app never waits for disk I/O).**
+4. **Micro-batching:** Every 10 milliseconds, a dedicated Rust background worker drains the queue.
+5. **Storage & Indexing:** The worker stores the raw bytes in a document table and automatically flattens/indexes every field into a metadata table for instant lookups.
+6. **Reset:** The queue is cleared and ready for the next spike in workloads.
+
+## Architectural Shifts (For the AI Systems)
+
+If you are building high-throughput systems—like an AI-native backend juggling heavy JSON payloads and agentic workflows—you already know the standard bottlenecks. Scaling normally requires deploying Redis for queuing, spinning up Celery workers for background writes, and performing a delicate dance with `asyncio` to prevent disk I/O from locking the main thread.
+
+`DBEngine` shifts that entire infrastructure topology directly into the PyO3 C-extension layer:
+
+### 1. Zero-Infrastructure Load Balancing (Spike Absorption)
+
+You do not need an external message broker to handle write-heavy spikes. The engine implements a bounded Rust `crossbeam` channel (capacity: 10,000) entirely in memory. If your API endpoints get hit with a sudden burst of traffic, the channel acts as a built-in shock absorber. The Rust background thread drains it at a steady state (batching every 10ms), protecting the underlying disk from I/O thrashing without requiring a separate load-balancing service.
+
+### 2. Eliminating the `asyncio` Event Loop Tax
+
+Python's `asyncio` is excellent for network calls, but local disk I/O is notoriously hostile to the event loop. By exposing synchronous Python methods (`def insert`) that instantly hand off memory to a Rust thread, `DBEngine` bypasses the need for asynchronous function coloring entirely. You achieve the non-blocking performance of `async` without writing a single `await`, completely eliminating the overhead of routing disk operations through `AnyIO` threadpools.
+
+### 3. Starlette Threadpool Synergy (GIL-Free Reads)
+
+When you define synchronous endpoints (`def`) in FastAPI, Starlette dispatches them to a worker threadpool. In a standard database setup, the Python Global Interpreter Lock (GIL) creates a bottleneck, forcing those threads to wait in line during reads. `DBEngine` explicitly calls `py.detach()` on all read operations, dropping the GIL before touching the `redb` storage engine. This allows your FastAPI workers to execute concurrent database reads simultaneously at bare-metal Rust speeds.
+
+## Two Rules for DBEngine
+
+Because writes happen in the background to keep your app fast, you must remember two things:
+
+- **Writes take ~10ms:** If you insert a document and immediately try to fetch it on the very next line of code, it might not be in the database yet.
+- **Always close the engine:** You **must** call `engine.close_engine()` before your application shuts down. If your script exits abruptly, any data sitting in the queue waiting for that 10ms window will be lost.
+
+## What this means for you as a Python developer
+
+1. **Store data at blazing non-blocking speeds:** No `async`/`await` required, the background thread handles the heavy lifting.
+2. **Retrieve data with true multi-threading:** The Python GIL is released during reads, allowing high-throughput frameworks to stay concurrent.
+
+```python
+from lorealdb import DBEngine
+
+# 1. Initialize
+engine = DBEngine("my_local_db.redb")
+
+# 2. Store (Non-blocking)
+engine.insert(id="usr_123", payload={"name": "Alice", "role": "admin"})
+
+# 3. Retrieve (GIL released)
+user = engine.get("usr_123")
+
+# 4. Always close before exiting!
+engine.close_engine()
+
+```
+
 ## Initialization
 
 ### `DBEngine(path)`
