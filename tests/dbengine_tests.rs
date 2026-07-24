@@ -18,6 +18,8 @@ fn wait_for_background_worker() {
     std::thread::sleep(Duration::from_millis(50));
 }
 
+/// Verifies that a standard Python dictionary can be successfully inserted into
+/// the database and retrieved with its data intact.
 #[test]
 fn test_insert_and_get() {
     Python::initialize();
@@ -51,6 +53,8 @@ fn test_insert_and_get() {
     engine.close_engine().unwrap();
 }
 
+/// Tests the insertion of raw JSON strings and confirms that multiple records
+/// (including missing ones) can be fetched accurately in a single batch request.
 #[test]
 fn test_insert_json_and_get_many() {
     Python::initialize();
@@ -92,6 +96,8 @@ fn test_insert_json_and_get_many() {
     engine.close_engine().unwrap();
 }
 
+/// Ensures that nested fields (like strings and integers) within JSON payloads are properly flattened,
+/// indexed in the background, and can be used to filter records.
 #[test]
 fn test_metadata_filtering() {
     Python::initialize();
@@ -128,6 +134,8 @@ fn test_metadata_filtering() {
     engine.close_engine().unwrap();
 }
 
+/// Validates the update (upsert) process by confirming old metadata indexes are cleaned up
+/// and replaced with new ones, and tests the complete removal of a record via delete.
 #[test]
 fn test_upsert_and_delete() {
     Python::initialize();
@@ -172,6 +180,8 @@ fn test_upsert_and_delete() {
     engine.close_engine().unwrap();
 }
 
+/// Checks that records can be correctly scanned and fetched when their
+/// document IDs match a specific string prefix.
 #[test]
 fn test_scan_prefix() {
     Python::initialize();
@@ -196,6 +206,8 @@ fn test_scan_prefix() {
     engine.close_engine().unwrap();
 }
 
+/// Ensures the engine safely catches and rejects structurally invalid JSON strings in
+/// both single and batch inserts without crashing the background worker.
 #[test]
 fn test_malformed_json_rejection() {
     Python::initialize();
@@ -231,6 +243,8 @@ fn test_malformed_json_rejection() {
     engine.close_engine().unwrap();
 }
 
+/// Verifies that complex JSON data types—such as booleans, floats, and nested arrays—are
+/// accurately flattened and mapped in the metadata index for querying.
 #[test]
 fn test_complex_type_indexing() {
     Python::initialize();
@@ -294,6 +308,9 @@ fn test_complex_type_indexing() {
     engine.close_engine().unwrap();
 }
 
+/// Confirms that if a batch insert encounters invalid data (a poison pill),
+/// the engine halts the batch safely to prevent bad data from entering the database,
+/// while preserving prior valid inserts.
 #[test]
 fn test_batch_operation_isolation() {
     Python::initialize();
@@ -339,6 +356,8 @@ fn test_batch_operation_isolation() {
     engine.close_engine().unwrap();
 }
 
+/// Tests the engine's shutdown sequence, ensuring that calling `close_engine`
+/// safely drains the queue and cleanly blocks any subsequent write attempts.
 #[test]
 fn test_lifecycle_and_channel_closure() {
     Python::initialize();
@@ -367,6 +386,9 @@ fn test_lifecycle_and_channel_closure() {
     );
 }
 
+/// Simulates a high-load environment with multiple threads to
+/// ensure the bounded write channel processes thousands of concurrent
+/// inserts safely without dropping records or blocking indefinitely.
 #[test]
 fn test_high_concurrency_thread_safety() {
     Python::initialize();
@@ -409,6 +431,9 @@ fn test_high_concurrency_thread_safety() {
     });
 }
 
+/// Tests graceful handling of operations on non-existent records,
+/// ensuring that deleting a missing ID does not fail,
+/// and upserting a missing ID safely acts as a fresh insert.
 #[test]
 fn test_ghost_operations() {
     Python::initialize();
@@ -466,6 +491,8 @@ fn test_ghost_operations() {
     engine.close_engine().unwrap();
 }
 
+/// Verifies that a collection of native Python dictionaries (`PyDict`) can be
+/// successfully batch-inserted via the foreground queue and queried afterward.
 #[test]
 fn test_insert_many_pydict() {
     Python::initialize();
@@ -497,6 +524,8 @@ fn test_insert_many_pydict() {
     engine.close_engine().unwrap();
 }
 
+/// Ensures that attempting to create a database at an invalid or restricted file
+/// path returns a graceful PyRuntimeError rather than panicking the application.
 #[test]
 fn test_engine_initialization_failure() {
     // A path that is a directory or lacks permissions
