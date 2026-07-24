@@ -13,10 +13,11 @@ use serde_json::Value;
 
 // import crossbeam-channel's Unbonded and Sender.
 use crossbeam_channel::Sender;
-use std::net::Shutdown::Write;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // helper function to index the keys and values of the json payload.
 // it helps to deep nest all the fields for easy metadata filtering later.
@@ -105,6 +106,19 @@ fn process_json_index(
     }
 }
 
+// Rust guard to handle thread panics and issues or if the thread closes down.
+// If thread closes down, Python will wait forever for a single write.
+struct WorkerHealthGuard {
+    flag: Arc<AtomicBool>,
+}
+
+impl Drop for WorkerHealthGuard {
+    fn drop(&mut self) {
+        // this block triggers if the thread dies or goes out of scope.
+        self.flag.store(false, Ordering::SeqCst);
+    }
+}
+
 // Define the key table and log table for storing logs.
 // TableDefinition<K, V>, K is key, V is value. &str is ref to str, &[u8] has ref + size
 const DOCUMENTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("documents");
@@ -135,6 +149,8 @@ pub struct DBEngine {
     write_txn: Sender<WriteOp>,
     // We add a handle for python to refer to before closing down.
     worker_handle: Option<thread::JoinHandle<()>>,
+    // add the failure flag.
+    is_healthy: Arc<AtomicBool>,
 }
 
 #[pymethods]
@@ -172,9 +188,18 @@ impl DBEngine {
         // the channel will not accept them and go into OOM. It will hold from the fastapi side.
         let (tx, rx) = bounded::<WriteOp>(10000);
 
+        // We set up the health trackers here.
+        let is_healthy = Arc::new(AtomicBool::new(true));
+        let worker_health = is_healthy.clone();
+
         // spawn the background worker thread, for processing the metadata of the json separately.
         // We implement a master write, to handle the disk operations in 3 types.
         let worker_handle = thread::spawn(move || {
+            // attach the worker health to the thread's lifespan.
+            let _health_guard = WorkerHealthGuard {
+                flag: worker_health,
+            };
+
             // create the batch time of 10ms.
             let queue_batch_time = Duration::from_millis(10);
 
@@ -311,6 +336,7 @@ impl DBEngine {
             db: db_arc,
             write_txn: tx,
             worker_handle: Some(worker_handle),
+            is_healthy,
         })
     }
 
@@ -341,6 +367,12 @@ impl DBEngine {
         id: &str,
         payload: Bound<'py, PyDict>,
     ) -> PyResult<()> {
+        // check the background thread safety
+        if !self.is_healthy.load(Ordering::SeqCst) {
+            return Err(PyRuntimeError::new_err(
+                "Background write worker has crashed!",
+            ));
+        }
         // Serialize the PyDict payload from Python to rust bytes.
         let dict_rust_value: Value = depythonize(&payload).map_err(|e| {
             PyRuntimeError::new_err(format!(
@@ -371,6 +403,12 @@ impl DBEngine {
     // simd_json. It saves the record in the DOCUMENTS_TABLE and sends the parsed json to a different background
     // worker to process it and insert into metadata indexing table for fast reads, search.
     pub fn insert_json(&self, id: &str, json_payload: &str) -> PyResult<()> {
+        // check the background thread safety
+        if !self.is_healthy.load(Ordering::SeqCst) {
+            return Err(PyRuntimeError::new_err(
+                "Background write worker has crashed!",
+            ));
+        }
         // validate and parse JSON data using serde_json.
         // if json is not valid, raise error to user.
         if let Err(e) = serde_json::from_str::<serde::de::IgnoredAny>(json_payload) {
@@ -401,6 +439,12 @@ impl DBEngine {
         _py: Python<'py>,
         records: Vec<(String, Bound<'py, PyDict>)>,
     ) -> PyResult<()> {
+        // check the background thread safety
+        if !self.is_healthy.load(Ordering::SeqCst) {
+            return Err(PyRuntimeError::new_err(
+                "Background write worker has crashed!",
+            ));
+        }
         // Validate the entire batch data, before we try to open a DB Transaction.
         // if one of those item is not validated, we skip the insert.
         for (id, dict_payload) in records {
@@ -438,6 +482,12 @@ impl DBEngine {
         _py: Python<'py>,
         records: Vec<(String, String)>,
     ) -> PyResult<()> {
+        // check the background thread safety
+        if !self.is_healthy.load(Ordering::SeqCst) {
+            return Err(PyRuntimeError::new_err(
+                "Background write worker has crashed!",
+            ));
+        }
         // Validate the entire batch data, before we try to open a DB Transaction.
         // if one of those item is not validated, we skip the insert and send a error message back to Python.
         for (id, json_payload) in records {
@@ -567,6 +617,12 @@ impl DBEngine {
     // Also, find all the indexes of the record in the metadata indexing
     // table and delete them in one transaction.
     pub fn delete(&self, id: &str) -> PyResult<()> {
+        // check the background thread safety
+        if !self.is_healthy.load(Ordering::SeqCst) {
+            return Err(PyRuntimeError::new_err(
+                "Background write worker has crashed!",
+            ));
+        }
         let op = WriteOp::Delete { id: id.to_string() };
         self.write_txn
             .send(op)
@@ -636,6 +692,12 @@ impl DBEngine {
     // We need to update a record in the documents table, with a get() and then insert().
     // We also need to update the metadata strings of that record in the metadata index table.
     pub fn upsert<'py>(&self, id: &str, payload: Bound<'py, PyDict>) -> PyResult<()> {
+        // check the background thread safety
+        if !self.is_healthy.load(Ordering::SeqCst) {
+            return Err(PyRuntimeError::new_err(
+                "Background write worker has crashed!",
+            ));
+        }
         // Serialize the PyDict payload from Python to a rust serde_json Value.
         let dict_rust_value: Value = depythonize(&payload).map_err(|e| {
             PyRuntimeError::new_err(format!(
